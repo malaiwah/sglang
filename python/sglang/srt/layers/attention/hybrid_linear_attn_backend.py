@@ -139,7 +139,6 @@ class MambaAttnBackendBase(AttentionBackend):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
@@ -186,7 +185,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     device=forward_batch.input_ids.device,
                 )
 
-                if self.topk > 1:
+                if forward_batch.spec_info.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrive_next_token
                     retrieve_next_sibling = forward_batch.spec_info.retrive_next_sibling
                     # retrieve_next_token is None during dummy run so skip tensor creation
@@ -201,10 +200,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
-                if (
-                    forward_batch.mamba_track_mask is not None
-                    and forward_batch.mamba_track_mask.any()
-                ):
+                if forward_batch.has_mamba_track:
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch
                     )
@@ -214,14 +210,11 @@ class MambaAttnBackendBase(AttentionBackend):
                         track_ssm_h_dst,
                         track_ssm_final_src,
                         track_ssm_final_dst,
-                    ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
+                    ) = self._init_track_ssm_indices(
+                        mamba_cache_indices, forward_batch
+                    )
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
-
-        has_mamba_track_mask = bool(
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        )
 
         return ForwardMetadata(
             query_start_loc=query_start_loc,
@@ -234,7 +227,6 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst=track_ssm_h_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
-            has_mamba_track_mask=has_mamba_track_mask,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -264,23 +256,30 @@ class MambaAttnBackendBase(AttentionBackend):
         """
         conv_state_len = self.conv_states_shape[-1]
 
-        # Calculate the end position of the last aligned chunk
-        lens_to_track = (
-            forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
+        mamba_track_seqlens = forward_batch.mamba_track_seqlens_cpu
+        prefix_lens = torch.as_tensor(
+            forward_batch.extend_prefix_lens_cpu, dtype=torch.int64
         )
+        lens_to_track = mamba_track_seqlens - prefix_lens
+
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
         aligned_len = (lens_to_track // mamba_cache_chunk_size) * mamba_cache_chunk_size
-        start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
-        start_indices = start_indices[forward_batch.mamba_track_mask]
 
-        # Create indices: [batch_size, conv_state_len]
+        query_start_loc_cpu = torch.as_tensor(
+            forward_batch.extend_start_loc_cpu, dtype=torch.int64
+        )
+        start_indices = query_start_loc_cpu + aligned_len - conv_state_len
+        start_indices = start_indices[forward_batch.mamba_track_mask_cpu]
+        start_indices = start_indices.to(self.device, non_blocking=True)
+
         indices = start_indices.unsqueeze(-1) + torch.arange(
             conv_state_len,
             device=self.device,
             dtype=start_indices.dtype,
         )
 
-        return indices.clamp(0, query_start_loc[-1] - 1)
+        max_index = query_start_loc[-1:] - 1
+        return torch.minimum(indices.clamp_min(0), max_index)
 
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch
@@ -318,13 +317,17 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_final_src: Source indices into last_recurrent_state buffer (for aligned seqs)
             track_ssm_final_dst: Destination cache slot indices (for aligned seqs)
         """
-        # Move to CPU to avoid kernel launches for masking operations
-        mamba_track_mask = forward_batch.mamba_track_mask.cpu()
-        extend_seq_lens = forward_batch.extend_seq_lens.cpu()
-        mamba_track_indices = forward_batch.mamba_track_indices.cpu()
-        mamba_cache_indices = mamba_cache_indices.cpu()
-        mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
-        prefix_lens = forward_batch.extend_prefix_lens.cpu()
+        # Move to CPU to avoid kernel launches for masking operations.
+        mamba_track_mask = forward_batch.mamba_track_mask_cpu
+        extend_seq_lens = torch.as_tensor(
+            forward_batch.extend_seq_lens_cpu, dtype=torch.int64
+        )
+        mamba_track_indices = forward_batch.mamba_track_indices_cpu
+        mamba_cache_indices = forward_batch.mamba_cache_indices_cpu
+        mamba_track_seqlens = forward_batch.mamba_track_seqlens_cpu
+        prefix_lens = torch.as_tensor(
+            forward_batch.extend_prefix_lens_cpu, dtype=torch.int64
+        )
 
         # Calculate the number of hidden states per request
         num_h_states = (extend_seq_lens - 1) // FLA_CHUNK_SIZE + 1
@@ -354,7 +357,6 @@ class MambaAttnBackendBase(AttentionBackend):
         )
         track_ssm_h_dst = dst_masked[not_aligned]
 
-        # Move back to GPU
         return (
             track_ssm_h_src.to(self.device, non_blocking=True),
             track_ssm_h_dst.to(self.device, non_blocking=True),
@@ -483,7 +485,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and self.topk > 1:
+        if forward_mode.is_target_verify() and spec_info.topk > 1:
             # They are None during cuda graph capture so skip the copy_...
             # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrive_next_token)
             # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrive_next_sibling)
@@ -544,7 +546,7 @@ class MambaAttnBackendBase(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and self.topk > 1:
+        if forward_mode.is_target_verify() and spec_info.topk > 1:
             bs_without_pad = spec_info.retrive_next_token.shape[0]
             self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
                 spec_info.retrive_next_token
@@ -620,7 +622,7 @@ class MambaAttnBackendBase(AttentionBackend):
         Note: Conv state tracking for extend is handled separately via gather operations
         using indices computed by `_init_track_conv_indices`.
         """
-        if forward_metadata.has_mamba_track_mask:
+        if forward_batch.has_mamba_track:
             h = h.squeeze(0)
 
             if forward_metadata.track_ssm_h_src.numel() > 0:
