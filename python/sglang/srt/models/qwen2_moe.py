@@ -30,6 +30,7 @@ from sglang.srt.distributed import (
     get_moe_data_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_tp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -45,6 +46,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
+    is_allocation_symmetric,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -57,6 +59,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -84,6 +87,9 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -99,8 +105,6 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
-
-
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -296,10 +300,83 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return final_hidden_states
 
     def _forward_router_experts(self, hidden_states: torch.Tensor):
+        sparse_output = self._forward_router_experts_b12x(hidden_states)
+        if sparse_output is not None:
+            return sparse_output
+
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         return self.experts(hidden_states, topk_output)
+
+    def _forward_router_experts_b12x(
+        self, hidden_states: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if not (_is_cuda and get_moe_runner_backend().is_b12x()):
+            return None
+
+        topk_config = self.topk.topk_config
+        if (
+            topk_config.use_grouped_topk
+            or topk_config.num_fused_shared_experts != 0
+            or topk_config.custom_routing_function is not None
+            or topk_config.correction_bias is not None
+            or topk_config.apply_routed_scaling_factor_on_output
+            or topk_config.scoring_func != "softmax"
+        ):
+            return None
+
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            _get_b12x_workspace_pool,
+        )
+
+        required_attrs = (
+            "w13_input_scale_quant",
+            "w13_weight",
+            "w13_blockscale_swizzled",
+            "g1_alphas",
+            "w2_input_scale_quant",
+            "w2_weight",
+            "w2_blockscale_swizzled",
+            "g2_alphas",
+        )
+        if not all(hasattr(self.experts, attr) for attr in required_attrs):
+            return None
+
+        from b12x.integration.tp_moe import B12XFP4ExpertWeights, b12x_sparse_moe_fp4
+
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            symm_output = torch.empty(
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+
+        experts = B12XFP4ExpertWeights(
+            a1_gscale=self.experts.w13_input_scale_quant,
+            w1_fp4=self.experts.w13_weight,
+            w1_blockscale=self.experts.w13_blockscale_swizzled,
+            w1_alphas=self.experts.g1_alphas,
+            a2_gscale=self.experts.w2_input_scale_quant,
+            w2_fp4=self.experts.w2_weight,
+            w2_blockscale=self.experts.w2_blockscale_swizzled,
+            w2_alphas=self.experts.g2_alphas,
+        )
+        return b12x_sparse_moe_fp4(
+            hidden_states,
+            experts=experts,
+            workspace=_get_b12x_workspace_pool(hidden_states.device),
+            top_k=topk_config.top_k,
+            gate_weight=self.gate.weight,
+            gate_bias=getattr(self.gate, "bias", None),
+            renormalize_topk=topk_config.renormalize,
+            output=symm_output,
+            input_scales_are_reciprocal=True,
+            input_scales_static=True,
+        )
 
     def forward_normal_dual_stream(
         self,
@@ -342,11 +419,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self._forward_router_experts(hidden_states)
 
         if shared_output is not None:
-            # In-place add is required to keep final_hidden_states in the
-            # symmetric memory pool (when --enable-symm-mem is used).
-            # An out-of-place add would allocate a new tensor outside symm
-            # memory, breaking subsequent symmetric collective operations.
             final_hidden_states += shared_output
+
         if (
             self.tp_size > 1
             and not should_allreduce_fusion

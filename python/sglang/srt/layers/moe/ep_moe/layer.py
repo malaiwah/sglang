@@ -237,6 +237,10 @@ class DeepEPMoE(FusedMoE):
             else:
                 assert False, "forward_deepgemm_contiguous is deprecated"
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+            if get_moe_runner_backend().is_b12x():
+                raise RuntimeError(
+                    "b12x does not support expert-parallel / low-latency MoE in sglang"
+                )
             if (
                 get_moe_runner_backend().is_flashinfer_cutedsl()
                 and self.quant_config.get_name() == "modelopt_fp4"

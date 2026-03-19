@@ -132,6 +132,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flex_attention",
     "nsa",
     # NVIDIA specific
+    "b12x",
     "cutlass_mla",
     "fa3",
     "fa4",
@@ -192,6 +193,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
     "cutlass",
+    "b12x",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -221,6 +223,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cudnn",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
+    "b12x",
 ]
 
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
@@ -825,6 +828,7 @@ class ServerArgs:
 
         # Handle speculative decoding logic.
         self._handle_speculative_decoding()
+        self._handle_b12x_moe_support()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -2873,6 +2877,37 @@ class ServerArgs:
 
         if self.enable_eplb:
             assert self.ep_size > 1
+
+    def _handle_b12x_moe_support(self):
+        def validate_backend(
+            runner_backend: Optional[str],
+            a2a_backend: Optional[str],
+            *,
+            name: str,
+        ):
+            if runner_backend != "b12x":
+                return
+            effective_a2a_backend = a2a_backend or self.moe_a2a_backend
+            if effective_a2a_backend != "none" or self.ep_size > 1:
+                raise ValueError(
+                    f"b12x does not support expert-parallel MoE in sglang. "
+                    f"Unsupported {name} configuration: "
+                    f"moe_runner_backend={runner_backend!r}, "
+                    f"moe_a2a_backend={effective_a2a_backend!r}, "
+                    f"ep_size={self.ep_size}. "
+                    f"Use b12x only with --moe-a2a-backend none and --ep-size 1."
+                )
+
+        validate_backend(
+            self.moe_runner_backend,
+            self.moe_a2a_backend,
+            name="main",
+        )
+        validate_backend(
+            self.speculative_moe_runner_backend,
+            self.speculative_moe_a2a_backend,
+            name="speculative",
+        )
 
     def _handle_elastic_ep(self):
         if self.elastic_ep_backend is not None:

@@ -108,8 +108,35 @@ class HybridAttnBackend(AttentionBackend):
             seq_lens_cpu,
         )
 
+    def init_forward_metadata_replay_cuda_graph_no_cpu(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ):
+        backend = self._select_backend(forward_mode)
+        backend.init_forward_metadata_replay_cuda_graph_no_cpu(
+            bs,
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            encoder_lens,
+            forward_mode,
+            spec_info,
+        )
+
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
+
+    def requires_seq_lens_cpu_for_replay(
+        self, forward_mode: Optional[ForwardMode] = None
+    ) -> bool:
+        backend = self.decode_backend if forward_mode is None else self._select_backend(forward_mode)
+        return backend.requires_seq_lens_cpu_for_replay(forward_mode)
 
     def forward(
         self,

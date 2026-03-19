@@ -38,6 +38,11 @@ class TboAttnBackend(AttentionBackend):
             # TODO for children, maybe can provide *smaller* max_bs to optimize
             item.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
 
+    def requires_seq_lens_cpu_for_replay(
+        self, forward_mode: Optional["ForwardMode"] = None
+    ) -> bool:
+        return self.primary.requires_seq_lens_cpu_for_replay(forward_mode)
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -101,6 +106,38 @@ class TboAttnBackend(AttentionBackend):
             spec_info=spec_info,
             replay_seq_lens_sum=seq_lens_sum,
             replay_seq_lens_cpu=seq_lens_cpu,
+        )
+
+    def init_forward_metadata_replay_cuda_graph_no_cpu(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: "ForwardMode",
+        spec_info: Optional[SpecInput],
+    ):
+        self.primary.init_forward_metadata_replay_cuda_graph_no_cpu(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+        )
+
+        self._init_forward_metadata_cuda_graph_children(
+            fn_name="init_forward_metadata_replay_cuda_graph_no_cpu",
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            replay_seq_lens_sum=seq_lens_sum,
+            replay_seq_lens_cpu=None,
         )
 
     def _init_forward_metadata_cuda_graph_children(
@@ -255,6 +292,12 @@ def _init_forward_metadata_cuda_graph_split(
             dict(
                 seq_lens_sum=output_seq_lens_cpu.sum().item(),
                 seq_lens_cpu=output_seq_lens_cpu,
+            )
+        )
+    elif fn_name == "init_forward_metadata_replay_cuda_graph_no_cpu":
+        ans.update(
+            dict(
+                seq_lens_sum=seq_lens[seq_slice].sum().item(),
             )
         )
     else:

@@ -107,6 +107,16 @@ def create_triton_backend(runner):
         return TritonAttnBackend(runner)
 
 
+@register_attention_backend("b12x")
+def create_b12x_backend(runner):
+    assert not runner.model_config.is_encoder_decoder, (
+        "Cross attention is not supported in the b12x attention backend."
+    )
+    from sglang.srt.layers.attention.b12x_backend import B12xAttnBackend
+
+    return B12xAttnBackend(runner)
+
+
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -211,12 +221,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         initialize_linear_attn_config(runner.server_args)
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
-                assert (
-                    runner.server_args.attention_backend == "triton"
-                    or runner.server_args.attention_backend == "trtllm_mha"
-                    or runner.server_args.attention_backend == "fa4"
-                    or runner.server_args.attention_backend == "flashinfer"
-                ), "triton, trtllm_mha, fa4, or flashinfer backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend to specify the backend."
+                assert runner.server_args.attention_backend in (
+                    "triton", "trtllm_mha", "fa4", "flashinfer", "b12x",
+                ), "triton, trtllm_mha, fa4, flashinfer, or b12x backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend to specify the backend."
             if is_npu():
                 assert (
                     runner.server_args.attention_backend == "ascend"

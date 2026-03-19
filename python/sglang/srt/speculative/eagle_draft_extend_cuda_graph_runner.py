@@ -493,17 +493,30 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.positions = buffers.positions[:num_tokens]
             forward_batch.spec_info.accept_length = buffers.accept_length[:bs]
 
-        self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum
-            + (bs - raw_bs) * self.seq_len_fill_value,
-            encoder_lens=None,
-            forward_mode=self.forward_mode,
-            spec_info=forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu,
-        )
+        attn_backend = self.eagle_worker.draft_extend_attn_backend
+        if attn_backend.requires_seq_lens_cpu_for_replay(self.forward_mode):
+            attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs=bs,
+                req_pool_indices=buffers.req_pool_indices,
+                seq_lens=buffers.seq_lens,
+                seq_lens_sum=forward_batch.seq_lens_sum
+                + (bs - raw_bs) * self.seq_len_fill_value,
+                encoder_lens=None,
+                forward_mode=self.forward_mode,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=buffers.seq_lens_cpu,
+            )
+        else:
+            attn_backend.init_forward_metadata_replay_cuda_graph_no_cpu(
+                bs=bs,
+                req_pool_indices=buffers.req_pool_indices,
+                seq_lens=buffers.seq_lens,
+                seq_lens_sum=forward_batch.seq_lens_sum
+                + (bs - raw_bs) * self.seq_len_fill_value,
+                encoder_lens=None,
+                forward_mode=self.forward_mode,
+                spec_info=forward_batch.spec_info,
+            )
 
         # Replay
         self.raw_bs = raw_bs

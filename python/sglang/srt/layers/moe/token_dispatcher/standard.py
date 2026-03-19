@@ -88,12 +88,10 @@ class StandardDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.moe_ep_size = get_moe_expert_parallel_world_size()
-        self.enable_flashinfer_cutlass_moe = (
-            get_moe_runner_backend().is_flashinfer_cutlass()
-        )
-        self.enable_flashinfer_trtllm_routed_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
-        )
+        moe_backend = get_moe_runner_backend()
+        self.enable_flashinfer_cutlass_moe = moe_backend.is_flashinfer_cutlass()
+        self.enable_flashinfer_trtllm_routed_moe = moe_backend.is_flashinfer_trtllm_routed()
+        self.enable_nvfp4_dispatch = moe_backend.is_flashinfer_cutlass()
         self.num_experts = moe_runner_config.num_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
         self.num_local_routed_experts = (
@@ -106,7 +104,7 @@ class StandardDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
 
-        if should_use_flashinfer_cutlass_moe_fp4_allgather():
+        if self.enable_nvfp4_dispatch and should_use_flashinfer_cutlass_moe_fp4_allgather():
             # all-gather fp4 hidden states
             from flashinfer import nvfp4_block_scale_interleave
 
