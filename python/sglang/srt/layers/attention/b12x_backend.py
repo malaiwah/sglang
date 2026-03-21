@@ -26,6 +26,10 @@ if TYPE_CHECKING:
 
 _B12X_PAGE_SIZE = 64
 
+# Maximum split count — the kernel selects the actual value at runtime
+# from a precomputed LUT indexed by max_pages.
+_B12X_MAX_NUM_SPLITS = 32
+
 
 @dataclass
 class B12xForwardMetadata:
@@ -33,7 +37,6 @@ class B12xForwardMetadata:
     cache_seqlens: torch.Tensor
     page_table: torch.Tensor
     mode: str  # "decode" or "extend"
-    num_splits: int  # pinned split count for the plan
 
 
 class B12xAttnBackend(AttentionBackend):
@@ -69,6 +72,12 @@ class B12xAttnBackend(AttentionBackend):
         self.workspace_pool = allocate_paged_attention_workspace_pool()
         self.forward_metadata: Optional[B12xForwardMetadata] = None
 
+        # Pre-allocate page offsets for graph-stable page table builds.
+        self.graph_page_offsets = torch.arange(
+            0, self.max_pages_per_req * self.page_size, self.page_size,
+            dtype=torch.int64, device=self.device,
+        )
+
         # CUDA graph state (allocated in init_cuda_graph_state).
         self.cuda_graph_cu_seqlens_q: Optional[torch.Tensor] = None
         self.cuda_graph_cache_seqlens: Optional[torch.Tensor] = None
@@ -100,14 +109,12 @@ class B12xAttnBackend(AttentionBackend):
         page_table = self._build_page_table(
             forward_batch.req_pool_indices[:bs], cache_seqlens
         )
-        num_splits = self._choose_num_splits(cache_seqlens, mode)
 
         self.forward_metadata = B12xForwardMetadata(
             cu_seqlens_q=cu_seqlens_q,
             cache_seqlens=cache_seqlens,
             page_table=page_table,
             mode=mode,
-            num_splits=num_splits,
         )
 
     # ------------------------------------------------------------------
@@ -148,9 +155,6 @@ class B12xAttnBackend(AttentionBackend):
             )
             mode = "decode"
         else:
-            # Extend / draft-extend / target-verify — all are extend from
-            # b12x's perspective.  For speculative draft-extend each request
-            # contributes a fixed number of query tokens.
             if spec_info is not None and hasattr(spec_info, "draft_token_num"):
                 tokens_per_req = spec_info.draft_token_num
             else:
@@ -160,31 +164,20 @@ class B12xAttnBackend(AttentionBackend):
                 dtype=torch.int32, device=self.device,
             )
             # Use max_context_len as placeholder cache length during capture
-            # so b12x's q_len <= cache_len validation passes.  Real values
-            # are written in-place at replay time.
+            # so b12x's q_len <= cache_len validation passes.
             cache_seqlens[:bs] = self.max_context_len
             mode = "extend"
 
-        # Fill graph-stable page table (always full max_pages_per_req columns
-        # so the shape is stable across capture and replay).
         page_table = self.cuda_graph_page_table
         self._build_page_table_into(
             req_pool_indices[:bs], cache_seqlens[:bs], page_table, bs
         )
-
-        # Pin num_splits for worst-case cache length so the compiled kernel
-        # works efficiently across all replay batches at this batch size.
-        worst_case_seqlens = torch.tensor(
-            [self.max_context_len], dtype=torch.int32, device=self.device
-        )
-        num_splits = self._choose_num_splits(worst_case_seqlens, mode)
 
         self.forward_metadata = B12xForwardMetadata(
             cu_seqlens_q=cu_seqlens_q[: bs + 1],
             cache_seqlens=cache_seqlens[:bs],
             page_table=page_table[:bs],
             mode=mode,
-            num_splits=num_splits,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -259,7 +252,7 @@ class B12xAttnBackend(AttentionBackend):
             md.cu_seqlens_q,
             causal=True,
             mode="decode",
-            num_splits=md.num_splits,
+            num_splits=_B12X_MAX_NUM_SPLITS,
         )
 
         k_descale, v_descale = self._get_descale_tensors(
@@ -329,7 +322,7 @@ class B12xAttnBackend(AttentionBackend):
             md.cu_seqlens_q,
             causal=True,
             mode="extend",
-            num_splits=md.num_splits,
+            num_splits=_B12X_MAX_NUM_SPLITS,
         )
 
         k_descale, v_descale = self._get_descale_tensors(
@@ -393,11 +386,7 @@ class B12xAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         cache_seqlens: torch.Tensor,
     ) -> torch.Tensor:
-        """Build a [batch, max_pages] page table from sglang's req_to_token pool.
-
-        For each request, we look up the first token slot of each page in
-        req_to_token and divide by page_size to get the physical page index.
-        """
+        """Build a [batch, max_pages] page table from sglang's req_to_token pool."""
         bs = req_pool_indices.shape[0]
         max_cache = int(cache_seqlens.max().item()) if bs > 0 else 0
         max_pages = max((max_cache + self.page_size - 1) // self.page_size, 1)
@@ -422,22 +411,19 @@ class B12xAttnBackend(AttentionBackend):
         dest: torch.Tensor,
         bs: int,
     ) -> None:
-        """Build page table in-place into a pre-allocated graph-stable buffer."""
-        page_table = self._build_page_table(req_pool_indices, cache_seqlens)
-        pt_rows, pt_cols = page_table.shape
-        dest[:pt_rows, :pt_cols] = page_table
+        """Build page table in-place into a pre-allocated graph-stable buffer.
 
-    def _choose_num_splits(
-        self, cache_seqlens: torch.Tensor, mode: str
-    ) -> int:
-        from b12x.integration.attention import choose_paged_attention_num_splits
-
-        return choose_paged_attention_num_splits(
-            cache_seqlens,
-            page_size=self.page_size,
-            mode=mode,
-            kv_dtype=self.kv_cache_dtype,
+        Uses dest's column count directly instead of computing max_pages from
+        cache_seqlens, avoiding a GPU->CPU sync on every replay step.
+        """
+        stride = self.req_to_token.shape[1]
+        page_offsets = self.graph_page_offsets[:dest.shape[1]]
+        row_indices = req_pool_indices[:bs].to(torch.int64).unsqueeze(1) * stride
+        flat_indices = (row_indices + page_offsets.unsqueeze(0)).clamp(
+            0, self.req_to_token.numel() - 1
         )
+        token_indices = self.req_to_token.view(-1)[flat_indices]
+        dest[:bs] = (token_indices // self.page_size).to(torch.int32)
 
     def _get_descale_tensors(
         self,
