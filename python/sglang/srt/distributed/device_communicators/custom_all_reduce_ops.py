@@ -21,7 +21,7 @@ try:
     import sgl_kernel.allreduce as _custom_ar
 except ImportError as e:
     if _is_cuda or _is_hip:
-        logger.warning("Failed to import from custom_ar with %r", e)
+        logger.warning("Failed to import custom_ar with %r", e)
     IS_CUSTOM_AR_AVAILABLE = False
     IS_QUICK_AR_AVAILABLE = False
     IS_MSCCLPP_AR_AVAILABLE = False

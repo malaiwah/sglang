@@ -618,6 +618,9 @@ class ServerArgs:
     disable_tokenizer_batch_decode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
+    enable_pcie_oneshot_allreduce: bool = False
+    enable_pcie_oneshot_allreduce_fusion: bool = False
+    pcie_oneshot_allreduce_max_size: str = "auto"
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
     pre_warm_nccl: bool = dataclasses.field(
@@ -5255,6 +5258,27 @@ class ServerArgs:
             "--disable-custom-all-reduce",
             action="store_true",
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
+        )
+        parser.add_argument(
+            "--enable-pcie-oneshot-allreduce",
+            action="store_true",
+            help="Enable PCIe oneshot custom allreduce for small messages. "
+            "Auto-enabled when PCIe topology is detected.",
+        )
+        parser.add_argument(
+            "--enable-pcie-oneshot-allreduce-fusion",
+            action="store_true",
+            help="Enable fused allreduce + RMSNorm for PCIe oneshot allreduce. "
+            "Auto-enabled when PCIe oneshot allreduce is active.",
+        )
+        parser.add_argument(
+            "--pcie-oneshot-allreduce-max-size",
+            type=str,
+            default="auto",
+            help="Max message size (bytes) for PCIe oneshot allreduce. "
+            "'auto' runs a crossover benchmark at startup. "
+            "Accepts integers or suffixed values like '64K', '128K'. "
+            "Default: auto.",
         )
         parser.add_argument(
             "--enable-mscclpp",

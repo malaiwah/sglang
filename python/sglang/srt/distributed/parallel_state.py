@@ -384,6 +384,13 @@ class GroupCoordinator:
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
 
+            if (
+                self.ca_comm is not None
+                and not self.ca_comm.disabled
+                and getattr(self.ca_comm, "_needs_crossover_bench", False)
+            ):
+                self.ca_comm.find_crossover_size(self.device_group)
+
             if is_hip():
                 try:
                     # Initialize a custom quick all-reduce implementation for AMD
@@ -697,6 +704,28 @@ class GroupCoordinator:
             use_1stage_ar,
         )
         return fused_outputs
+
+    def fused_allreduce_gemma_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Attempt fused all-reduce + Gemma RMSNorm via custom all-reduce communicator."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+
+        if hasattr(ca_comm, "fused_allreduce_gemma_rmsnorm"):
+            try:
+                return ca_comm.fused_allreduce_gemma_rmsnorm(
+                    input_, residual_inp_, weight_, eps
+                )
+            except Exception:
+                pass
+
+        return None
 
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str

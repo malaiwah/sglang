@@ -272,3 +272,8 @@ sgl-kernel/csrc/**/*_musa/
 *.glb
 *.ply
 *.npz
+
+# Local build artifacts.
+cache/
+sgl-kernel/.fetchcontent-cache/
+sgl-kernel/build-*/
