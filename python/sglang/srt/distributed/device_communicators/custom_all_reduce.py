@@ -407,50 +407,121 @@ class CustomAllreduce:
 
         return False
 
-    def find_crossover_size(self, nccl_group) -> int:
-        """Benchmark custom AR vs NCCL at doubling sizes to find the crossover.
+    def _bench_graph_latency(self, size_bytes, nccl_group, s, warmup, iters):
+        """Benchmark custom AR vs NCCL at one size using CUDA graph replay.
 
-        Sets self.max_size to the largest message size (bytes) where custom AR
-        is still faster than NCCL. All ranks must call this collectively.
+        Returns (custom_us, nccl_us) median over 3 runs to filter outliers.
         """
-        WARMUP = 50
-        ITERS = 200
+        dev = self.device
+        numel = size_bytes // 2  # bf16
 
-        sizes = []
+        def run_custom():
+            with torch.cuda.stream(s):
+                g_inp = torch.ones(numel, dtype=torch.bfloat16, device=dev)
+                g_out = torch.zeros_like(g_inp)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=s):
+                self._ops.all_reduce(self._ptr, g_inp, g_out, 0, 0)
+            if hasattr(self._ops, "get_graph_buffer_ipc_meta"):
+                handle, off = self._ops.get_graph_buffer_ipc_meta(self._ptr)
+                all_meta = [None] * self.world_size
+                dist.all_gather_object(all_meta, (handle, off), group=self.group)
+                self._ops.register_graph_buffers(
+                    self._ptr, [d[0] for d in all_meta], [d[1] for d in all_meta]
+                )
+            dist.barrier(group=nccl_group)
+            with torch.cuda.stream(s):
+                for _ in range(warmup):
+                    g.replay()
+            s.synchronize()
+            t0 = time.perf_counter()
+            with torch.cuda.stream(s):
+                for _ in range(iters):
+                    g.replay()
+            s.synchronize()
+            return (time.perf_counter() - t0) / iters * 1e6
+
+        def run_nccl():
+            with torch.cuda.stream(s):
+                g_inp = torch.ones(numel, dtype=torch.bfloat16, device=dev)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=s):
+                dist.all_reduce(g_inp, group=nccl_group)
+            with torch.cuda.stream(s):
+                for _ in range(warmup):
+                    g.replay()
+            s.synchronize()
+            t0 = time.perf_counter()
+            with torch.cuda.stream(s):
+                for _ in range(iters):
+                    g.replay()
+            s.synchronize()
+            return (time.perf_counter() - t0) / iters * 1e6
+
+        # 3 runs, take median to filter outliers
+        custom_runs = sorted([run_custom() for _ in range(3)])
+        nccl_runs = sorted([run_nccl() for _ in range(3)])
+        return custom_runs[1], nccl_runs[1]
+
+
+    def find_crossover_size(self, nccl_group) -> int:
+        """Benchmark custom AR vs NCCL using CUDA graph replay.
+
+        Two-phase approach:
+        1. Coarse sweep (powers of 2) to find approximate crossover region
+        2. Fine sweep (8KB steps) around the crossover for precise result
+
+        Uses median-of-3 runs per size to filter outliers.
+        """
+        WARMUP = 100
+        ITERS = 1000
+
+        # Phase 1: coarse sweep (powers of 2)
+        coarse_sizes = []
         b = 1024
         while b <= _PCIE_BENCHMARK_CEILING:
-            sizes.append(b)
+            coarse_sizes.append(b)
             b *= 2
 
         dev = self.device
+        s = torch.cuda.Stream(device=dev)
         results = []
 
-        for size_bytes in sizes:
-            numel = size_bytes // 2  # bf16
-            inp = torch.ones(numel, dtype=torch.bfloat16, device=dev)
-            out = torch.zeros_like(inp)
+        first_nccl_win = None
+        last_custom_win = 0
 
-            for _ in range(WARMUP):
-                self.all_reduce(inp, out=out)
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for _ in range(ITERS):
-                self.all_reduce(inp, out=out)
-            torch.cuda.synchronize()
-            custom_us = (time.perf_counter() - t0) / ITERS * 1e6
-
-            inp2 = torch.ones(numel, dtype=torch.bfloat16, device=dev)
-            for _ in range(WARMUP):
-                dist.all_reduce(inp2, group=nccl_group)
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for _ in range(ITERS):
-                dist.all_reduce(inp2, group=nccl_group)
-            torch.cuda.synchronize()
-            nccl_us = (time.perf_counter() - t0) / ITERS * 1e6
-
+        for size_bytes in coarse_sizes:
+            custom_us, nccl_us = self._bench_graph_latency(
+                size_bytes, nccl_group, s, WARMUP, ITERS
+            )
             winner = "custom" if custom_us < nccl_us else "NCCL"
             results.append((size_bytes, custom_us, nccl_us, winner))
+            if winner == "custom":
+                last_custom_win = size_bytes
+            elif first_nccl_win is None:
+                first_nccl_win = size_bytes
+
+        # Phase 2: fine sweep around crossover region (8KB steps)
+        if last_custom_win > 0 and first_nccl_win is not None:
+            fine_start = last_custom_win
+            fine_end = min(first_nccl_win, last_custom_win * 4)
+            step = 8 * 1024  # 8KB granularity
+            fine_size = fine_start + step
+            while fine_size < fine_end:
+                # Must be multiple of 16 bytes for allreduce alignment
+                fine_size = (fine_size // 16) * 16
+                if fine_size not in [s for s, _, _, _ in results]:
+                    custom_us, nccl_us = self._bench_graph_latency(
+                        fine_size, nccl_group, s, WARMUP, ITERS
+                    )
+                    winner = "custom" if custom_us < nccl_us else "NCCL"
+                    results.append((fine_size, custom_us, nccl_us, winner))
+                    if winner == "custom":
+                        last_custom_win = max(last_custom_win, fine_size)
+                fine_size += step
+
+        # Sort results by size for display
+        results.sort(key=lambda x: x[0])
 
         crossover = 0
         for size_bytes, custom_us, nccl_us, winner in results:
