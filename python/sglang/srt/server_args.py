@@ -2476,6 +2476,18 @@ class ServerArgs:
             self.attention_backend = "triton"
 
         if (
+            is_sm120_supported()
+            and use_mla_backend
+            and self.kv_cache_dtype in ["fp8_e4m3", "fp8_e5m2"]
+            and self.attention_backend is None
+        ):
+            logger.warning(
+                f"SM120 with MLA and FP8 KV cache only supports triton attention backend. "
+                f"Setting attention backend to triton."
+            )
+            self.attention_backend = "triton"
+
+        if (
             self.prefill_attention_backend == "fa4"
             and not self.use_mla_backend()
             and is_sm100_supported()
