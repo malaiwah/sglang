@@ -5686,6 +5686,18 @@ class ServerArgs:
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
+            "--enable-pcie-oneshot-allreduce",
+            action="store_true",
+            help="Enable the b12x PCIe oneshot all-reduce backend on PCIe-only CUDA topologies.",
+        )
+        parser.add_argument(
+            "--pcie-oneshot-allreduce-max-size",
+            type=str,
+            default=ServerArgs.pcie_oneshot_allreduce_max_size,
+            help="Maximum message size for the PCIe oneshot all-reduce backend. "
+            "Accepts integers in bytes, K/KB, M/MB, or 'auto'.",
+        )
+        parser.add_argument(
             "--enable-mscclpp",
             action="store_true",
             help="Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",

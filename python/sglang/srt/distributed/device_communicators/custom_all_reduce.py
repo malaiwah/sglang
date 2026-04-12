@@ -1,9 +1,10 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/custom_all_reduce.py
 
 import ctypes
+import importlib
 import logging
 from contextlib import contextmanager
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any, List, Optional, Union
 
 import torch
@@ -31,6 +32,60 @@ _is_hip = is_hip()
 _is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
+
+_PCIE_BENCHMARK_CEILING = 1024 * 1024
+
+
+def parse_pcie_ar_max_size(value: str | int | None) -> Optional[int]:
+    """Parse a byte-size string, or return None for ``auto``."""
+
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if value.lower() == "auto":
+        return None
+    normalized = value.upper().strip()
+    suffixes = {
+        "KB": 1024,
+        "K": 1024,
+        "MB": 1024 * 1024,
+        "M": 1024 * 1024,
+    }
+    for suffix, multiplier in sorted(suffixes.items(), key=lambda item: -len(item[0])):
+        if normalized.endswith(suffix):
+            return int(normalized[: -len(suffix)]) * multiplier
+    return int(value)
+
+
+def _get_pcie_oneshot_settings() -> tuple[bool, Optional[int], bool]:
+    if not _is_cuda or _is_hip or _is_musa:
+        return False, None, False
+
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+    except Exception:
+        return False, None, False
+
+    enabled = bool(getattr(server_args, "enable_pcie_oneshot_allreduce", False))
+    if not enabled:
+        return False, None, False
+
+    explicit_max_size = parse_pcie_ar_max_size(
+        getattr(server_args, "pcie_oneshot_allreduce_max_size", "auto")
+    )
+    return True, explicit_max_size, explicit_max_size is None
+
+
+@lru_cache(maxsize=1)
+def _load_b12x_pcie_oneshot_runtime():
+    try:
+        module = importlib.import_module("b12x.distributed")
+    except Exception:
+        return None
+    return getattr(module, "PCIeOneshotAllReduce", None)
 
 
 class CustomAllreduce:
@@ -64,11 +119,9 @@ class CustomAllreduce:
         self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
         self.original_disabled = True  # To store the original state
         self.use_amd_deterministic_impl = _use_amd_deterministic_impl()
-
-        if not ops.IS_CUSTOM_AR_AVAILABLE:
-            # disable because of missing custom allreduce library
-            # e.g. in a non-cuda environment
-            return
+        self._ptr = 0
+        self._pcie_runtime = None
+        self._needs_crossover_bench = False
 
         rank = dist.get_rank(group=group)
         world_size = dist.get_world_size(group=group)
@@ -80,22 +133,58 @@ class CustomAllreduce:
         # now `device` is a `torch.device` object
         assert isinstance(device, torch.device)
         self.device = device
+        self.group = group
+        self.rank = rank
+        self.world_size = world_size
+        self.max_size = max_size
+
+        pcie_enabled, explicit_pcie_max_size, pcie_auto_size = _get_pcie_oneshot_settings()
+        if not ops.IS_CUSTOM_AR_AVAILABLE and not pcie_enabled:
+            # disable because of missing custom allreduce library
+            # e.g. in a non-cuda environment
+            return
         full_nvlink = can_use_custom_all_reduce_with_nvlink(
             group=group,
             device=device,
             supported_world_size=self._SUPPORTED_WORLD_SIZES,
             cls_name="CustomAllreduce",
+            allow_pcie=pcie_enabled,
         )
         if full_nvlink is None:
             return  # fail to get nvlink status
-
-        self.group = group
-        self.max_size = max_size
-        self.rank = rank
-        self.world_size = world_size
         self.full_nvlink = full_nvlink
 
-        if not _is_hip:
+        if not _is_hip and pcie_enabled and not self.full_nvlink:
+            runtime_cls = _load_b12x_pcie_oneshot_runtime()
+            if runtime_cls is None:
+                logger.warning(
+                    "Custom allreduce is disabled because --enable-pcie-oneshot-allreduce "
+                    "was requested but b12x.distributed.PCIeOneshotAllReduce is unavailable."
+                )
+                return
+
+            if explicit_pcie_max_size is None:
+                self.max_size = min(max_size, _PCIE_BENCHMARK_CEILING)
+                self._needs_crossover_bench = pcie_auto_size
+            else:
+                self.max_size = min(max_size, explicit_pcie_max_size)
+
+            self._pcie_runtime = runtime_cls.from_exchange_group(
+                exchange_group=group,
+                device=self.device,
+                eager_buffer_bytes=self.max_size,
+                max_size=self.max_size,
+            )
+            log_info_on_rank0(
+                logger,
+                "Using b12x PCIe oneshot allreduce backend "
+                f"(world_size={world_size}, max_size={self.max_size}).",
+            )
+        elif not ops.IS_CUSTOM_AR_AVAILABLE:
+            # disable because of missing custom allreduce library
+            # e.g. in a non-cuda environment
+            return
+        elif not _is_hip:
             # Buffers memory are owned by this Python class and passed to C++.
             # Meta data composes of two parts: meta data for synchronization and a
             # temporary buffer for storing intermediate allreduce results.
@@ -183,10 +272,14 @@ class CustomAllreduce:
         """
         try:
             self._IS_CAPTURING = True
-            yield
+            if self._pcie_runtime is None:
+                yield
+            else:
+                with self._pcie_runtime.capture():
+                    yield
         finally:
             self._IS_CAPTURING = False
-            if not self.disabled:
+            if not self.disabled and self._pcie_runtime is None:
                 self.register_graph_buffers()
 
     def _get_ipc_meta(self, inp: torch.Tensor):
@@ -224,10 +317,18 @@ class CustomAllreduce:
         return handles, offsets
 
     def register_buffer(self, inp: torch.Tensor):
+        if self._pcie_runtime is not None:
+            raise NotImplementedError(
+                "b12x PCIe oneshot backend does not support tensor-based register_buffer(); "
+                "use eager allreduce or CUDA graph capture registration instead."
+            )
         handles, offsets = self._get_ipc_meta(inp)
         ops.register_buffer(self._ptr, inp, handles, offsets)
 
     def register_graph_buffers(self):
+        if self._pcie_runtime is not None:
+            self._pcie_runtime.register_graph_buffers()
+            return
         if _is_hip:
             handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
             handles, offsets = self._gather_ipc_meta((bytes(handle), offset))
@@ -256,6 +357,8 @@ class CustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
+        if self._pcie_runtime is not None:
+            return self._pcie_runtime.should_allreduce(inp)
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
@@ -279,6 +382,9 @@ class CustomAllreduce:
         return False
 
     def _all_reduce_impl(self, inp: torch.Tensor, registered: bool):
+        if self._pcie_runtime is not None:
+            return self._pcie_runtime.all_reduce(inp)
+
         out = torch.empty_like(inp)
         if not _is_hip:  # CUDA-like
             if registered:
@@ -324,7 +430,17 @@ class CustomAllreduce:
         else:
             return self._all_reduce_impl(input, registered=False)
 
+    def find_crossover_size(self, nccl_group) -> int:
+        if self._pcie_runtime is None:
+            raise RuntimeError("crossover autotuning is only available for the b12x PCIe oneshot backend")
+        crossover = self._pcie_runtime.find_crossover_size(nccl_group)
+        self.max_size = self._pcie_runtime.max_size
+        return crossover
+
     def close(self):
+        if self._pcie_runtime is not None:
+            self._pcie_runtime.close()
+            self._pcie_runtime = None
         if not self.disabled and self._ptr:
             ops.dispose(self._ptr)
             if _is_cuda:

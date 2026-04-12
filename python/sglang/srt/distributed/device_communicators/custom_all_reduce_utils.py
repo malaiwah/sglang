@@ -404,6 +404,7 @@ def can_use_custom_all_reduce_with_nvlink(
     device: torch.device,
     supported_world_size: List[int],
     cls_name: str,
+    allow_pcie: bool = False,
 ) -> Optional[bool]:  # None if fail; otherwise return whether NVLink is available
     assert (
         dist.get_backend(group) != dist.Backend.NCCL
@@ -449,7 +450,7 @@ def can_use_custom_all_reduce_with_nvlink(
     # test nvlink first, this will filter out most of the cases
     # where custom allreduce is not supported
     # this checks hardware and driver support for NVLink
-    if world_size > 2 and not full_nvlink:
+    if world_size > 2 and not full_nvlink and not allow_pcie:
         logger.warning(
             f"{cls_name} is disabled because it's not supported on"
             " more than two PCIe-only GPUs. To silence this warning, "
