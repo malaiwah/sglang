@@ -6,10 +6,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import triton
-import triton.language as tl
-
-from b12x.attention.paged.planner import build_decode_chunk_pages_lut
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -22,64 +18,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 _B12X_PAGE_SIZE = 64
-_B12X_DECODE_BLOCK_CHUNKS = 128
-_B12X_DECODE_BLOCK_PAGES = 128
-
-
-@triton.jit
-def build_b12x_decode_graph_page_table_triton(
-    req_to_token_ptr,
-    req_pool_indices_ptr,
-    page_table_ptr,
-    req_to_token_row_stride,
-    page_table_row_stride,
-    max_pages_per_req,
-    PAGE_SIZE: tl.constexpr,
-    BLOCK_PAGES: tl.constexpr,
-):
-    req_idx = tl.program_id(axis=0)
-    page_block_idx = tl.program_id(axis=1)
-
-    req_pool_idx = tl.load(req_pool_indices_ptr + req_idx).to(tl.int64)
-    page_offsets = page_block_idx * BLOCK_PAGES + tl.arange(0, BLOCK_PAGES)
-    page_mask = page_offsets < max_pages_per_req
-    flat_token_offsets = req_pool_idx * req_to_token_row_stride + page_offsets.to(tl.int64) * PAGE_SIZE
-    token_indices = tl.load(req_to_token_ptr + flat_token_offsets, mask=page_mask, other=0)
-    tl.store(
-        page_table_ptr + req_idx * page_table_row_stride + page_offsets,
-        (token_indices // PAGE_SIZE).to(tl.int32),
-        mask=page_mask,
-    )
-
-
-@triton.jit
-def update_b12x_decode_graph_metadata_triton(
-    cache_seqlens_ptr,
-    merge_indptr_ptr,
-    block_valid_mask_ptr,
-    chunk_pages_ptr,
-    max_chunks_per_req,
-    PAGE_SIZE: tl.constexpr,
-    BLOCK_CHUNKS: tl.constexpr,
-):
-    req_idx = tl.program_id(axis=0)
-    chunk_block_idx = tl.program_id(axis=1)
-
-    cache_len = tl.load(cache_seqlens_ptr + req_idx).to(tl.int32)
-    chunk_pages = tl.load(chunk_pages_ptr).to(tl.int32)
-    num_pages = tl.maximum((cache_len + (PAGE_SIZE - 1)) // PAGE_SIZE, 1)
-    num_chunks = (num_pages + chunk_pages - 1) // chunk_pages
-
-    tl.store(merge_indptr_ptr + req_idx + 1, num_chunks)
-
-    chunk_offsets = chunk_block_idx * BLOCK_CHUNKS + tl.arange(0, BLOCK_CHUNKS)
-    chunk_mask = chunk_offsets < max_chunks_per_req
-    is_active = chunk_offsets < num_chunks
-    tl.store(
-        block_valid_mask_ptr + req_idx * max_chunks_per_req + chunk_offsets,
-        is_active.to(tl.int32),
-        mask=chunk_mask,
-    )
 
 
 @dataclass
@@ -91,7 +29,6 @@ class B12xForwardMetadata:
     use_cuda_graph: bool
     graph_key: tuple[str, int] | None = None
     req_pool_indices: torch.Tensor | None = None
-    decode_chunk_pages: torch.Tensor | None = None
 
 
 class B12xAttnBackend(AttentionBackend):
@@ -135,6 +72,9 @@ class B12xAttnBackend(AttentionBackend):
         self.forward_metadata: Optional[B12xForwardMetadata] = None
         self.eager_workspaces: dict[str, PagedAttentionWorkspace] = {}
         self.cuda_graph_workspaces: dict[tuple[str, int], PagedAttentionWorkspace] = {}
+        self.fp8_descale_cache: dict[
+            tuple[int, int, float, float], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
 
         self.graph_page_offsets = torch.arange(
             0,
@@ -147,10 +87,6 @@ class B12xAttnBackend(AttentionBackend):
         self.cuda_graph_cu_seqlens_q: Optional[torch.Tensor] = None
         self.cuda_graph_cache_seqlens: Optional[torch.Tensor] = None
         self.cuda_graph_page_table: Optional[torch.Tensor] = None
-        self.cuda_graph_decode_chunk_pages: Optional[torch.Tensor] = None
-        self.cuda_graph_decode_chunk_pages_lut: Optional[torch.Tensor] = None
-        self.cuda_graph_decode_max_chunks_per_req: Optional[int] = None
-        self.cuda_graph_decode_worst_page_count: Optional[int] = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -184,34 +120,6 @@ class B12xAttnBackend(AttentionBackend):
         self.cuda_graph_page_table = torch.zeros(
             max_bs, self.max_pages_per_req, dtype=torch.int32, device=self.device
         )
-        self.cuda_graph_decode_chunk_pages = torch.ones(
-            1, dtype=torch.int32, device=self.device
-        )
-        decode_chunk_pages_lut = build_decode_chunk_pages_lut(
-            q_dtype=self.q_dtype,
-            kv_dtype=self.kv_cache_dtype,
-            batch=max_bs,
-            page_size=self.page_size,
-            head_dim_qk=self.head_dim,
-            head_dim_vo=self.head_dim,
-            gqa_group_size=self.num_q_heads // self.num_kv_heads,
-            max_effective_kv_pages=self.max_pages_per_req,
-        )
-        self.cuda_graph_decode_chunk_pages_lut = torch.tensor(
-            (decode_chunk_pages_lut[0], *decode_chunk_pages_lut),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.cuda_graph_decode_chunk_pages[0] = int(decode_chunk_pages_lut[0])
-        worst_page_count = 1
-        max_chunks_per_req = 1
-        for page_count, chunk_pages in enumerate(decode_chunk_pages_lut, start=1):
-            num_chunks = (page_count + int(chunk_pages) - 1) // int(chunk_pages)
-            if num_chunks > max_chunks_per_req:
-                max_chunks_per_req = num_chunks
-                worst_page_count = page_count
-        self.cuda_graph_decode_max_chunks_per_req = max_chunks_per_req
-        self.cuda_graph_decode_worst_page_count = worst_page_count
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -228,10 +136,18 @@ class B12xAttnBackend(AttentionBackend):
         graph_key = (mode, bs)
         workspace = self._get_or_create_graph_workspace(graph_key, mode=mode, total_q_capacity=num_tokens)
         if mode == "decode":
-            self._bind_decode_graph_runtime_buffers(workspace, bs, cache_seqlens=seq_lens[:bs])
-            cache_seqlens = workspace.cache_seqlens
-            page_table = workspace.page_table
-            cu_seqlens_q = workspace.cu_seqlens_q
+            cache_seqlens, page_table, cu_seqlens_q = self._fill_decode_cuda_graph_metadata(
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+            )
+            self._bind_decode_graph_runtime_buffers(
+                workspace,
+                bs,
+                cache_seqlens=cache_seqlens,
+                page_table=page_table,
+                cu_seqlens_q=cu_seqlens_q,
+            )
         else:
             cache_seqlens, page_table, cu_seqlens_q = self._fill_cuda_graph_metadata(
                 bs=bs,
@@ -250,7 +166,6 @@ class B12xAttnBackend(AttentionBackend):
             use_cuda_graph=True,
             graph_key=graph_key,
             req_pool_indices=req_pool_indices[:bs] if mode == "decode" else None,
-            decode_chunk_pages=self.cuda_graph_decode_chunk_pages if mode == "decode" else None,
         )
 
     def init_forward_metadata_replay_cuda_graph_no_cpu(
@@ -271,10 +186,18 @@ class B12xAttnBackend(AttentionBackend):
         if workspace is None:
             raise RuntimeError(f"missing captured b12x cuda-graph workspace for {graph_key}")
         if mode == "decode":
-            self._bind_decode_graph_runtime_buffers(workspace, bs, cache_seqlens=seq_lens[:bs])
-            cache_seqlens = workspace.cache_seqlens
-            page_table = workspace.page_table
-            cu_seqlens_q = workspace.cu_seqlens_q
+            cache_seqlens, page_table, cu_seqlens_q = self._fill_decode_cuda_graph_metadata(
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+            )
+            self._bind_decode_graph_runtime_buffers(
+                workspace,
+                bs,
+                cache_seqlens=cache_seqlens,
+                page_table=page_table,
+                cu_seqlens_q=cu_seqlens_q,
+            )
         else:
             cache_seqlens, page_table, cu_seqlens_q = self._fill_cuda_graph_metadata(
                 bs=bs,
@@ -293,7 +216,6 @@ class B12xAttnBackend(AttentionBackend):
             use_cuda_graph=True,
             graph_key=graph_key,
             req_pool_indices=req_pool_indices[:bs] if mode == "decode" else None,
-            decode_chunk_pages=self.cuda_graph_decode_chunk_pages if mode == "decode" else None,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -345,8 +267,6 @@ class B12xAttnBackend(AttentionBackend):
         workspace = self._get_workspace(md, total_q=q.shape[0])
         if not md.use_cuda_graph:
             workspace.prepare(md.page_table, md.cache_seqlens, md.cu_seqlens_q)
-        elif layer.layer_id == self.kv_contract_layer_id:
-            self._run_decode_graph_metadata_update(workspace, md)
 
         k_cache, v_cache = self._get_paged_kv_buffers(forward_batch.token_to_kv_pool, layer.layer_id)
         q3 = q.view(q.shape[0], layer.tp_q_head_num, layer.qk_head_dim)
@@ -365,6 +285,11 @@ class B12xAttnBackend(AttentionBackend):
             output=output,
             k_descale=k_descale,
             v_descale=v_descale,
+            prepare_decode_graph_metadata=(
+                md.use_cuda_graph
+                and torch.cuda.is_current_stream_capturing()
+                and layer.layer_id == self.kv_contract_layer_id
+            ),
         )
         return out.view(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
@@ -388,7 +313,7 @@ class B12xAttnBackend(AttentionBackend):
                 layer.v_scale,
             )
 
-        md = self._require_forward_metadata("extend")
+        md = self._require_forward_metadata_any("extend", "verify")
         workspace = self._get_workspace(md, total_q=q.shape[0])
         if not md.use_cuda_graph:
             workspace.prepare(md.page_table, md.cache_seqlens, md.cu_seqlens_q)
@@ -422,6 +347,16 @@ class B12xAttnBackend(AttentionBackend):
             )
         return self.forward_metadata
 
+    def _require_forward_metadata_any(self, *expected_modes: str) -> B12xForwardMetadata:
+        if self.forward_metadata is None:
+            raise RuntimeError("b12x backend metadata has not been initialized")
+        if self.forward_metadata.mode not in expected_modes:
+            expected_desc = "/".join(expected_modes)
+            raise RuntimeError(
+                f"b12x backend expected {expected_desc} metadata, got {self.forward_metadata.mode}"
+            )
+        return self.forward_metadata
+
     def _get_workspace(self, md: B12xForwardMetadata, *, total_q: int) -> PagedAttentionWorkspace:
         if md.use_cuda_graph:
             assert md.graph_key is not None
@@ -429,8 +364,8 @@ class B12xAttnBackend(AttentionBackend):
             if workspace is None:
                 raise RuntimeError(f"missing captured b12x cuda-graph workspace for {md.graph_key}")
             return workspace
-        if md.mode == "extend":
-            return self._get_or_create_eager_extend_workspace()
+        if md.mode in ("extend", "verify"):
+            return self._get_or_create_eager_extend_workspace(mode=md.mode)
         workspace = self.eager_workspaces.get(md.mode)
         if workspace is None:
             workspace = self.workspace_cls.for_contract(
@@ -450,14 +385,19 @@ class B12xAttnBackend(AttentionBackend):
             self.eager_workspaces[md.mode] = workspace
         return workspace
 
-    def _get_or_create_eager_extend_workspace(self) -> PagedAttentionWorkspace:
-        workspace = self.eager_workspaces.get("extend")
+    def _get_or_create_eager_extend_workspace(
+        self,
+        *,
+        mode: str = "extend",
+    ) -> PagedAttentionWorkspace:
+        workspace = self.eager_workspaces.get(mode)
         if workspace is not None:
             return workspace
 
         total_q_capacity = self._eager_extend_total_q_capacity()
         batch_capacity = self._eager_extend_batch_capacity(total_q_capacity)
         workspace = self.workspace_cls.for_eager_extend_capacity(
+            mode=mode,
             device=self.device,
             dtype=self.q_dtype,
             kv_dtype=self.kv_cache_dtype,
@@ -472,7 +412,7 @@ class B12xAttnBackend(AttentionBackend):
             num_cache_pages=self.num_cache_pages,
             use_cuda_graph=False,
         )
-        self.eager_workspaces["extend"] = workspace
+        self.eager_workspaces[mode] = workspace
         return workspace
 
     def _eager_extend_total_q_capacity(self) -> int:
@@ -525,7 +465,11 @@ class B12xAttnBackend(AttentionBackend):
         return workspace
 
     def _mode_from_forward_mode(self, forward_mode: ForwardMode) -> str:
-        return "decode" if forward_mode.is_decode_or_idle() else "extend"
+        if forward_mode.is_decode_or_idle():
+            return "decode"
+        if forward_mode.is_target_verify():
+            return "verify"
+        return "extend"
 
     def _select_kv_contract_layer_id(self) -> int:
         mapping = getattr(self.token_to_kv_pool, "full_attention_layer_id_mapping", None)
@@ -596,6 +540,25 @@ class B12xAttnBackend(AttentionBackend):
         self._build_page_table_into(req_pool_indices[:bs], cache_seqlens, page_table, bs)
         return cache_seqlens, page_table, cu_seqlens_q
 
+    def _fill_decode_cuda_graph_metadata(
+        self,
+        *,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert self.cuda_graph_cu_seqlens_q is not None
+        assert self.cuda_graph_cache_seqlens is not None
+        assert self.cuda_graph_page_table is not None
+
+        cache_seqlens = self.cuda_graph_cache_seqlens[:bs]
+        cache_seqlens.copy_(seq_lens[:bs].to(torch.int32))
+        cu_seqlens_q = self.cuda_graph_cu_seqlens_q[: bs + 1]
+        cu_seqlens_q.copy_(torch.arange(0, bs + 1, dtype=torch.int32, device=self.device))
+        page_table = self.cuda_graph_page_table[:bs]
+        self._build_page_table_into(req_pool_indices[:bs], cache_seqlens, page_table, bs)
+        return cache_seqlens, page_table, cu_seqlens_q
+
     def _validate_layer_contract(self, layer: RadixAttention) -> None:
         if layer.tp_q_head_num != self.num_q_heads or layer.tp_k_head_num != self.num_kv_heads:
             raise ValueError("b12x backend expects layer head counts to match the backend contract")
@@ -612,20 +575,21 @@ class B12xAttnBackend(AttentionBackend):
         bs: int,
         total_q_capacity: int,
     ) -> None:
-        max_cache_seqlen = self.max_context_len
         if mode == "decode":
-            if self.cuda_graph_decode_worst_page_count is None:
-                raise RuntimeError("decode graph chunk-pages LUT is not initialized")
-            max_cache_seqlen = int(self.cuda_graph_decode_worst_page_count * self.page_size)
+            workspace.prepare_decode_graph_replay_state(
+                batch=bs,
+                total_q_capacity=total_q_capacity,
+                max_page_table_width=self.max_pages_per_req,
+                max_cache_page_count=self.max_pages_per_req,
+            )
+            self._bind_decode_graph_runtime_buffers(workspace, bs)
+            return
         workspace.prepare_for_capacity(
             batch=bs,
             total_q_capacity=total_q_capacity,
             max_page_table_width=self.max_pages_per_req,
-            max_cache_seqlen=max_cache_seqlen,
+            max_cache_seqlen=self.max_context_len,
         )
-        if mode == "decode":
-            self._bind_decode_graph_runtime_buffers(workspace, bs)
-            self._validate_decode_graph_chunk_capacity(workspace, bs=bs)
 
     def _get_paged_kv_buffers(
         self,
@@ -686,106 +650,23 @@ class B12xAttnBackend(AttentionBackend):
         bs: int,
         *,
         cache_seqlens: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
     ) -> None:
         assert self.cuda_graph_page_table is not None
         assert self.cuda_graph_cu_seqlens_q is not None
-        workspace.page_table = self.cuda_graph_page_table[:bs]
+        if page_table is None:
+            page_table = self.cuda_graph_page_table[:bs]
         if cache_seqlens is None:
             assert self.cuda_graph_cache_seqlens is not None
-            workspace.cache_seqlens = self.cuda_graph_cache_seqlens[:bs]
-        else:
-            workspace.cache_seqlens = cache_seqlens
-        workspace.cu_seqlens_q = self.cuda_graph_cu_seqlens_q[: bs + 1]
-
-    def _validate_decode_graph_chunk_capacity(
-        self,
-        workspace: PagedAttentionWorkspace,
-        *,
-        bs: int,
-    ) -> None:
-        if workspace.request_indices is None:
-            raise RuntimeError("decode graph workspace is missing request indices")
-        if bs <= 0:
-            raise ValueError("decode graph replay requires bs > 0")
-
-        work_items_capacity = int(workspace.request_indices.shape[0])
-        if work_items_capacity % bs != 0:
-            raise RuntimeError(
-                "decode graph workspace request_indices shape is incompatible with the batch bucket"
-            )
-        max_chunks_per_req = work_items_capacity // bs
-        if max_chunks_per_req <= 0:
-            raise RuntimeError("decode graph workspace must allocate at least one chunk per request")
-        if self.cuda_graph_decode_max_chunks_per_req is None:
-            raise RuntimeError("decode graph chunk-pages LUT is not initialized")
-        if self.cuda_graph_decode_max_chunks_per_req > max_chunks_per_req:
-            raise RuntimeError(
-                "decode graph workspace capacity is too small for the current chunking policy"
-            )
-
-    def _run_decode_graph_metadata_update(
-        self,
-        workspace: PagedAttentionWorkspace,
-        md: B12xForwardMetadata,
-    ) -> None:
-        if workspace.page_table is None:
-            raise RuntimeError("decode graph workspace is missing page_table")
-        if workspace.cache_seqlens is None:
-            raise RuntimeError("decode graph workspace is missing cache_seqlens")
-        if workspace.request_indices is None:
-            raise RuntimeError("decode graph workspace is missing request indices")
-        if workspace.block_valid_mask is None:
-            raise RuntimeError("decode graph workspace is missing block_valid_mask")
-        if workspace.merge_indptr is None or workspace.o_indptr is None:
-            raise RuntimeError("decode graph workspace is missing indptr buffers")
-        if workspace.kv_chunk_size_ptr is None:
-            raise RuntimeError("decode graph workspace is missing kv_chunk_size_ptr")
-        if md.req_pool_indices is None or md.decode_chunk_pages is None:
-            raise RuntimeError("decode graph metadata is missing runtime graph inputs")
-        if self.cuda_graph_decode_chunk_pages_lut is None:
-            raise RuntimeError("decode graph chunk-pages LUT is not initialized")
-
-        bs = int(workspace.cache_seqlens.shape[0])
-        max_cache_pages = torch.div(
-            workspace.cache_seqlens[:bs].amax() + (self.page_size - 1),
-            self.page_size,
-            rounding_mode="floor",
-        ).clamp_(min=1, max=self.max_pages_per_req).to(torch.int64)
-        md.decode_chunk_pages.copy_(
-            torch.index_select(self.cuda_graph_decode_chunk_pages_lut, 0, max_cache_pages.view(1))
+            cache_seqlens = self.cuda_graph_cache_seqlens[:bs]
+        if cu_seqlens_q is None:
+            cu_seqlens_q = self.cuda_graph_cu_seqlens_q[: bs + 1]
+        workspace.bind_cuda_graph_runtime_metadata(
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
         )
-        page_blocks = triton.cdiv(int(workspace.page_table.shape[1]), _B12X_DECODE_BLOCK_PAGES)
-        build_b12x_decode_graph_page_table_triton[(bs, page_blocks)](
-            self.req_to_token,
-            md.req_pool_indices,
-            workspace.page_table,
-            self.req_to_token.stride(0),
-            workspace.page_table.stride(0),
-            workspace.page_table.shape[1],
-            PAGE_SIZE=self.page_size,
-            BLOCK_PAGES=_B12X_DECODE_BLOCK_PAGES,
-        )
-
-        workspace.block_valid_mask.zero_()
-        workspace.merge_indptr.zero_()
-        max_chunks_per_req = int(workspace.request_indices.shape[0]) // bs
-        chunk_blocks = triton.cdiv(max_chunks_per_req, _B12X_DECODE_BLOCK_CHUNKS)
-        update_b12x_decode_graph_metadata_triton[(bs, chunk_blocks)](
-            workspace.cache_seqlens,
-            workspace.merge_indptr,
-            workspace.block_valid_mask,
-            md.decode_chunk_pages,
-            max_chunks_per_req,
-            PAGE_SIZE=self.page_size,
-            BLOCK_CHUNKS=_B12X_DECODE_BLOCK_CHUNKS,
-        )
-        torch.cumsum(
-            workspace.merge_indptr[1 : bs + 1],
-            dim=0,
-            out=workspace.merge_indptr[1 : bs + 1],
-        )
-        workspace.o_indptr[: bs + 1].copy_(workspace.merge_indptr[: bs + 1])
-        workspace.kv_chunk_size_ptr.copy_(md.decode_chunk_pages * self.page_size)
 
     def _get_descale_tensors(
         self,
@@ -796,16 +677,23 @@ class B12xAttnBackend(AttentionBackend):
             return None, None
         k_scale = 1.0 if layer.k_scale is None else float(layer.k_scale_float)
         v_scale = 1.0 if layer.v_scale is None else float(layer.v_scale_float)
+        cache_key = (int(layer.layer_id), int(batch_size), k_scale, v_scale)
+        cached = self.fp8_descale_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        # b12x accepts per-request descales, so avoid per-head materialization.
         k_descale = torch.full(
-            (batch_size, self.num_kv_heads),
+            (batch_size,),
             k_scale,
             dtype=torch.float32,
             device=self.device,
         )
         v_descale = torch.full(
-            (batch_size, self.num_kv_heads),
+            (batch_size,),
             v_scale,
             dtype=torch.float32,
             device=self.device,
         )
+        self.fp8_descale_cache[cache_key] = (k_descale, v_descale)
         return k_descale, v_descale

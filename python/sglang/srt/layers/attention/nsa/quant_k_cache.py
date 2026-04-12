@@ -205,9 +205,14 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
 
     assert num_tokens == num_tokens_, f"k_nope and k_rope must have same num_tokens"
 
-    # Ensure contiguous tensors for kernel
-    k_nope = k_nope.contiguous()
-    k_rope = k_rope.contiguous()
+    if k_nope.stride(-1) != 1:
+        raise ValueError(
+            f"k_nope must have contiguous last dimension, got stride={k_nope.stride()}"
+        )
+    if k_rope.stride(-1) != 1:
+        raise ValueError(
+            f"k_rope must have contiguous last dimension, got stride={k_rope.stride()}"
+        )
 
     num_tiles = dim_nope // group_size
 

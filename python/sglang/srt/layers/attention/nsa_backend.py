@@ -75,6 +75,16 @@ global_workspace_buffer = None
 _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
 
 
+def _get_b12x_paged_mqa_logits_metadata(
+    context_lens: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    try:
+        from b12x.integration.nsa_indexer import get_paged_mqa_logits_metadata
+    except (ImportError, ModuleNotFoundError):
+        return None
+    return get_paged_mqa_logits_metadata(context_lens, 64)
+
+
 @dataclass(frozen=True)
 class NSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -280,7 +290,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _NSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse", "flashmla_kv", "b12x", "fa3", "tilelang", "trtllm"
 ]
 
 
@@ -317,6 +327,11 @@ class NativeSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.model_v_head_dim = getattr(
+            model_runner.model_config, "v_head_dim", self.qk_head_dim
+        )
+        self.q_dtype = model_runner.dtype
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -354,6 +369,7 @@ class NativeSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.b12x_workspaces: Dict[str, object] = {}
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         if self.device_sm_major >= 10 or self.nsa_decode_impl == "trtllm":
@@ -368,6 +384,9 @@ class NativeSparseAttnBackend(
         else:
             self.workspace_buffer = None
 
+        if self.nsa_prefill_impl == "b12x" or self.nsa_decode_impl == "b12x":
+            self._validate_b12x_contract(model_runner)
+
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
             next_pow_of_2 = 1 << (l - 1).bit_length()
@@ -375,6 +394,139 @@ class NativeSparseAttnBackend(
                 next_pow_of_2, device=self.device, dtype=torch.int32
             )
         return self._arange_buf[:l]
+
+    def _validate_b12x_contract(self, model_runner: ModelRunner) -> None:
+        model_arch = model_runner.model_config.hf_config.architectures[0]
+        model_type = getattr(model_runner.model_config.hf_config, "model_type", None)
+        if model_type != "glm_moe_dsa":
+            raise ValueError(
+                "b12x only supports the GLM DSA model family in v1 "
+                f"(model_type=glm_moe_dsa); got architecture={model_arch}, "
+                f"model_type={model_type}."
+            )
+        if self.device_capability != (12, 0):
+            raise ValueError(
+                f"b12x requires SM120, got sm_{self.device_capability[0]}{self.device_capability[1]}."
+            )
+        if self.real_page_size != 64:
+            raise ValueError(
+                f"b12x requires page_size=64, got {self.real_page_size}."
+            )
+        if self.kv_cache_dtype != torch.float8_e4m3fn or not self.nsa_kv_cache_store_fp8:
+            raise ValueError("b12x requires FP8 NSA KV cache storage.")
+        if (
+            self.qk_nope_head_dim != 192
+            or self.kv_lora_rank != 512
+            or self.qk_rope_head_dim != 64
+            or self.model_v_head_dim != 256
+            or self.nsa_index_topk != 2048
+        ):
+            raise ValueError(
+                "b12x v1 only supports the GLM-5.1 MLA geometry "
+                "(qk_nope=192, kv_lora_rank=512, qk_rope=64, v=256, topk=2048)."
+            )
+        if model_runner.server_args.enable_nsa_prefill_context_parallel:
+            raise ValueError("b12x does not support NSA context parallel in v1.")
+        if getattr(model_runner, "enable_hisparse", False):
+            raise ValueError("b12x does not support HiSparse in v1.")
+
+    def _get_b12x_workspace(
+        self,
+        *,
+        mode: str,
+        total_q: int,
+        batch: int,
+        v_head_dim: int,
+    ):
+        from b12x.integration.mla import MLAWorkspace
+
+        workspace_mode = "verify" if mode == "target_verify" else mode
+        workspace = self.b12x_workspaces.get(workspace_mode)
+        if (
+            workspace is not None
+            and workspace.max_total_q >= total_q
+            and workspace.max_batch >= batch
+        ):
+            return workspace
+
+        if workspace is not None:
+            total_q = max(total_q, workspace.max_total_q)
+            batch = max(batch, workspace.max_batch)
+
+        workspace = MLAWorkspace.for_fixed_capacity(
+            mode=workspace_mode,
+            device=self.device,
+            dtype=self.q_dtype,
+            kv_dtype=self.kv_cache_dtype,
+            num_q_heads=self.num_q_heads,
+            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            topk=self.nsa_index_topk,
+            max_total_q=max(total_q, 1),
+            max_batch=max(batch, 1),
+            page_size=self.real_page_size,
+        )
+        self.b12x_workspaces[workspace_mode] = workspace
+        return workspace
+
+    def _forward_b12x(
+        self,
+        *,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        metadata: NSAMetadata,
+        sm_scale: float,
+        v_head_dim: int,
+        mode: Literal["decode", "extend", "target_verify", "draft_extend"],
+    ) -> torch.Tensor:
+        from b12x.integration.mla import (
+            MLASparseDecodeMetadata,
+            MLASparseExtendMetadata,
+            sparse_mla_decode_forward,
+            sparse_mla_extend_forward,
+        )
+
+        workspace = self._get_b12x_workspace(
+            mode=mode,
+            total_q=q_all.shape[0],
+            batch=metadata.cache_seqlens_int32.shape[0],
+            v_head_dim=v_head_dim,
+        )
+        if mode == "decode":
+            b12x_metadata = MLASparseDecodeMetadata(
+                page_table_1=page_table_1,
+                cache_seqlens_int32=metadata.cache_seqlens_int32,
+                nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
+                max_seq_len_k=metadata.max_seq_len_k,
+            )
+            return sparse_mla_decode_forward(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                metadata=b12x_metadata,
+                workspace=workspace,
+                sm_scale=sm_scale,
+                v_head_dim=v_head_dim,
+            )
+
+        b12x_metadata = MLASparseExtendMetadata(
+            page_table_1=page_table_1,
+            cache_seqlens_int32=metadata.cache_seqlens_int32,
+            nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
+            nsa_cu_seqlens_q=metadata.nsa_cu_seqlens_q,
+            nsa_cu_seqlens_k=metadata.nsa_cu_seqlens_k,
+            max_seq_len_q=metadata.max_seq_len_q,
+            max_seq_len_k=metadata.max_seq_len_k,
+            mode=mode,
+        )
+        return sparse_mla_extend_forward(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            metadata=b12x_metadata,
+            workspace=workspace,
+            sm_scale=sm_scale,
+            v_head_dim=v_head_dim,
+        )
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size
@@ -605,9 +757,36 @@ class NativeSparseAttnBackend(
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
 
         paged_mqa_schedule_metadata = None
-        # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
-        # Compute it once per forward batch and reuse it across layers.
-        if is_cuda() and (
+        use_b12x_paged_indexer = (
+            (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and self.nsa_decode_impl == "b12x"
+            )
+            or (
+                (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend()
+                )
+                and self.nsa_prefill_impl == "b12x"
+            )
+        )
+        if use_b12x_paged_indexer and is_cuda() and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+        ):
+            seqlens_32 = (
+                seqlens_expanded
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend()
+                )
+                else cache_seqlens_int32
+            )
+            paged_mqa_schedule_metadata = _get_b12x_paged_mqa_logits_metadata(
+                seqlens_32
+            )
+        elif is_cuda() and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
@@ -893,7 +1072,30 @@ class NativeSparseAttnBackend(
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
-        if is_cuda() and (
+        use_b12x_paged_indexer = (
+            (forward_mode.is_decode_or_idle() and self.nsa_decode_impl == "b12x")
+            or (
+                (forward_mode.is_target_verify() or forward_mode.is_draft_extend())
+                and self.nsa_prefill_impl == "b12x"
+            )
+        )
+        if use_b12x_paged_indexer and is_cuda() and (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend()
+        ):
+            seqlens_32 = (
+                seqlens_expanded
+                if (
+                    forward_mode.is_target_verify()
+                    or forward_mode.is_draft_extend()
+                )
+                else cache_seqlens_int32
+            )
+            paged_mqa_schedule_metadata = _get_b12x_paged_mqa_logits_metadata(
+                seqlens_32
+            )
+        elif is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend()
@@ -1042,7 +1244,32 @@ class NativeSparseAttnBackend(
             )
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
+        use_b12x_paged_indexer = (
+            (forward_mode.is_decode_or_idle() and self.nsa_decode_impl == "b12x")
+            or (
+                (forward_mode.is_target_verify() or forward_mode.is_draft_extend())
+                and self.nsa_prefill_impl == "b12x"
+            )
+        )
+        if use_b12x_paged_indexer:
+            seqlens_32 = (
+                seqlens_expanded
+                if (
+                    forward_mode.is_target_verify()
+                    or forward_mode.is_draft_extend()
+                )
+                else metadata.cache_seqlens_int32
+            )
+            new_schedule = _get_b12x_paged_mqa_logits_metadata(
+                seqlens_32
+            )
+            if new_schedule is None:
+                object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
+            elif metadata.paged_mqa_schedule_metadata is None:
+                object.__setattr__(metadata, "paged_mqa_schedule_metadata", new_schedule)
+            else:
+                metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+        elif is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend()
@@ -1062,11 +1289,11 @@ class NativeSparseAttnBackend(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
                 if metadata.paged_mqa_schedule_metadata is None:
-                    metadata.paged_mqa_schedule_metadata = new_schedule
+                    object.__setattr__(metadata, "paged_mqa_schedule_metadata", new_schedule)
                 else:
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
             except (ImportError, ModuleNotFoundError):
-                metadata.paged_mqa_schedule_metadata = None
+                object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.nsa_cache_seqlens_int32 is not None
@@ -1357,7 +1584,9 @@ class NativeSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if nsa_impl == "b12x":
+            page_table_1 = topk_indices
+        elif envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -1389,6 +1618,27 @@ class NativeSparseAttnBackend(
                 )
             )
 
+        if nsa_impl == "b12x":
+            if forward_batch.hisparse_coordinator is not None:
+                raise ValueError("b12x does not support HiSparse in v1.")
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            extend_mode: Literal["extend", "target_verify", "draft_extend"]
+            if forward_batch.forward_mode.is_target_verify():
+                extend_mode = "target_verify"
+            elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
+                extend_mode = "draft_extend"
+            else:
+                extend_mode = "extend"
+            return self._forward_b12x(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                metadata=metadata,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+                mode=extend_mode,
+            )
         if nsa_impl == "tilelang":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -1541,6 +1791,8 @@ class NativeSparseAttnBackend(
                 topk_indices,
                 layer.layer_id,
             )
+        elif self.nsa_decode_impl == "b12x":
+            page_table_1 = topk_indices
         elif envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
@@ -1550,6 +1802,20 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
 
+        if self.nsa_decode_impl == "b12x":
+            if forward_batch.hisparse_coordinator is not None:
+                raise ValueError("b12x does not support HiSparse in v1.")
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_b12x(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                metadata=metadata,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+                mode="decode",
+            )
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2074,6 +2340,10 @@ class NativeSparseAttnBackend(
         """
         from sglang.srt.utils import get_device_sm, is_blackwell
 
+        if self.nsa_prefill_impl == "b12x":
+            self.use_mha = False
+            return
+
         # Decide MHA vs MLA
         if forward_batch and forward_batch.forward_mode.is_extend_without_speculative():
             # Check if sequence meets criteria for MHA_ONE_SHOT
@@ -2125,6 +2395,8 @@ class NativeSparseAttnBackend(
         SGLANG_NSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
         """
+        if self.nsa_prefill_impl == "b12x" or self.nsa_decode_impl == "b12x":
+            return TopkTransformMethod.PAGED
         if (
             # disable for MTP
             self.nsa_kv_cache_store_fp8

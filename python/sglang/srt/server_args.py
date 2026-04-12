@@ -172,6 +172,7 @@ NSA_CHOICES = [
     "flashmla_sparse",
     "flashmla_kv",
     "flashmla_auto",
+    "b12x",
     "fa3",
     "tilelang",
     "aiter",
@@ -631,6 +632,8 @@ class ServerArgs:
     disable_tokenizer_batch_decode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
+    enable_pcie_oneshot_allreduce: bool = False
+    pcie_oneshot_allreduce_max_size: str = "auto"
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
     pre_warm_nccl: bool = dataclasses.field(
@@ -1473,7 +1476,14 @@ class ServerArgs:
             "fp8_e4m3",
         ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
-    def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+    def _set_default_nsa_backends(
+        self,
+        kv_cache_dtype: str,
+        major: int,
+        *,
+        model_arch: Optional[str] = None,
+        model_type: Optional[str] = None,
+    ) -> str:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
@@ -1489,13 +1499,31 @@ class ServerArgs:
             )
             return
 
+        if (
+            model_type == "glm_moe_dsa"
+            and major == 12
+            and kv_cache_dtype == "fp8_e4m3"
+        ):
+            if not user_set_prefill:
+                self.nsa_prefill_backend = "b12x"
+            if not user_set_decode:
+                self.nsa_decode_backend = "b12x"
+            logger.warning(
+                "Set NSA backends for the GLM DSA family on SM120 to b12x "
+                f"(architecture={model_arch}, prefill={self.nsa_prefill_backend}, "
+                f"decode={self.nsa_decode_backend})."
+            )
+            return
+
         if not user_set_prefill and not user_set_decode and is_hip():
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
             if major >= 10:
-                self.nsa_prefill_backend = "trtllm"
-                self.nsa_decode_backend = "trtllm"
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "trtllm"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "trtllm"
             else:
                 # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
                 if not user_set_prefill:
@@ -1528,6 +1556,8 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+        model_type = getattr(hf_config, "model_type", None)
+        is_glm_dsa_family = model_type == "glm_moe_dsa"
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None:
@@ -1543,19 +1573,20 @@ class ServerArgs:
         ]:
             self.dtype = "bfloat16"
 
-        if model_arch in [
+        if is_glm_dsa_family or model_arch in [
             "DeepseekV3ForCausalLM",
+            "DeepseekV3ForCausalLMNextN",
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
-            "GlmMoeDsaForCausalLM",
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_nsa(hf_config):  # DeepSeek 3.2/GLM 5
-                if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
+                if is_glm_dsa_family and is_blackwell_supported():
                     envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
                     logger.warning(
-                        "Force NSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
+                        "Force NSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) "
+                        f"for GLM DSA family model {model_arch} on Blackwell."
                     )
                 else:
                     if envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
@@ -1626,7 +1657,12 @@ class ServerArgs:
 
                     major, _ = torch.cuda.get_device_capability()
                     self._set_default_nsa_kv_cache_dtype(major, self.quantization)
-                    self._set_default_nsa_backends(self.kv_cache_dtype, major)
+                    self._set_default_nsa_backends(
+                        self.kv_cache_dtype,
+                        major,
+                        model_arch=model_arch,
+                        model_type=getattr(hf_config, "model_type", None),
+                    )
 
                 if self.enable_nsa_prefill_context_parallel:
                     assert (

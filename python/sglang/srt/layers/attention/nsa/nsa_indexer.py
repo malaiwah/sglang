@@ -242,7 +242,10 @@ class Indexer(MultiPlatformOp):
             yield
 
     def _weights_proj_bf16_in_fp32_out(self, x: torch.Tensor) -> torch.Tensor:
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+        ):
             weight = self.weights_proj.weight
             out = torch.empty(
                 (x.shape[0], weight.shape[0]),
@@ -389,6 +392,240 @@ class Indexer(MultiPlatformOp):
             return
         dst.copy_(src)
 
+    @staticmethod
+    def _use_b12x_indexer(forward_batch: ForwardBatch) -> bool:
+        attn_backend = forward_batch.attn_backend
+        if forward_batch.forward_mode.is_decode_or_idle():
+            return getattr(attn_backend, "nsa_decode_impl", None) == "b12x"
+        return getattr(attn_backend, "nsa_prefill_impl", None) == "b12x"
+
+    def _get_b12x_indexer_phantoms(
+        self,
+        forward_batch: ForwardBatch,
+        q_rows: int,
+    ) -> dict:
+        """Lazily create and cache phantom tensors for stable kernel cache keys."""
+        phantoms = getattr(self, "_b12x_indexer_phantoms", None)
+        if phantoms is not None and phantoms.get("_max_q_rows", 0) >= q_rows:
+            return phantoms
+        from b12x.integration.nsa_indexer import make_nsa_indexer_contract_phantoms
+
+        page_size = forward_batch.token_to_kv_pool.page_size
+        # Upper bound on page table width: total KV pool pages.
+        max_pages = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+            layer_id=self.layer_id
+        ).shape[0]
+        max_q = max(q_rows, phantoms.get("_max_q_rows", 0)) if phantoms else q_rows
+        phantoms = make_nsa_indexer_contract_phantoms(
+            max_q_rows=max_q,
+            num_heads=self.n_heads,
+            max_pages=max_pages,
+            page_size=page_size,
+            device=forward_batch.seq_lens.device,
+        )
+        phantoms["_max_q_rows"] = max_q
+        self._b12x_indexer_phantoms = phantoms
+        return phantoms
+
+    def _get_b12x_paged_topk(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        from b12x.integration.nsa_indexer import (
+            NSAIndexerPagedDecodeMetadata,
+            sparse_nsa_index_decode_logits_paged,
+        )
+
+        q_offset = min(sum(metadata.get_nsa_extend_len_cpu()), q_fp8.shape[0])
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        ):
+            seqlens_per_query = metadata.get_seqlens_expanded()[:q_offset]
+        else:
+            seqlens_per_query = metadata.get_seqlens_int32()[:q_offset]
+        if q_offset == 0:
+            return torch.full(
+                (q_fp8.shape[0], self.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=q_fp8.device,
+            )
+        phantoms = self._get_b12x_indexer_phantoms(forward_batch, q_offset)
+        logits = sparse_nsa_index_decode_logits_paged(
+            q_fp8=q_fp8[:q_offset],
+            weights=weights[:q_offset],
+            index_k_cache=forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            ),
+            metadata=NSAIndexerPagedDecodeMetadata(
+                real_page_table=metadata.get_page_table_64()[:q_offset],
+                cache_seqlens_int32=seqlens_per_query,
+                paged_mqa_schedule_metadata=getattr(
+                    metadata, "paged_mqa_schedule_metadata", None
+                ),
+            ),
+            page_size=forward_batch.token_to_kv_pool.page_size,
+            contract_phantoms=phantoms,
+        )
+        topk_result = metadata.topk_transform(logits, self.index_topk)
+        if q_offset < q_fp8.shape[0]:
+            pad_len = q_fp8.shape[0] - q_offset
+            padding = torch.full(
+                (pad_len, topk_result.shape[1]),
+                -1,
+                dtype=topk_result.dtype,
+                device=topk_result.device,
+            )
+            topk_result = torch.cat([topk_result, padding], dim=0)
+        return topk_result
+
+    def _get_b12x_ragged_topk(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        from b12x.integration.nsa_indexer import (
+            NSAIndexerExtendLogitsMetadata,
+            sparse_nsa_index_extend_logits,
+        )
+        assert forward_batch.forward_mode.is_extend_without_speculative()
+        if _is_hip:
+            raise NotImplementedError(
+                "b12x ragged extend logits currently target the CUDA/DeepGEMM contract only"
+            )
+
+        page_size = forward_batch.token_to_kv_pool.page_size
+        assert page_size == 64, "only support page size 64"
+        assert len(weights.shape) == 3
+        weights = weights.squeeze(-1)
+
+        block_tables = metadata.get_page_table_64()
+        ks, ke = metadata.get_indexer_kvcache_range()
+        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+        seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
+        max_seq_len = torch.max(indexer_seq_lens_cpu).item()
+        k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+            layer_id,
+            metadata.get_indexer_seq_len(),
+            block_tables,
+            seq_len_sum,
+            max_seq_len,
+        )
+        if _is_fp8_fnuz:
+            k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
+        else:
+            k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+        k_scale = k_scale.view(torch.float32).squeeze(-1)
+        kv_fp8 = (k_fp8, k_scale)
+
+        seq_lens_expanded = metadata.get_seqlens_expanded()
+        token_to_batch_idx = metadata.get_token_to_batch_idx()
+        q_offset = ks.shape[0]
+        token_nums = q_fp8.shape[0]
+        device = q_fp8.device
+        topk_result = torch.full(
+            (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
+        )
+        if q_offset == 0:
+            return topk_result
+
+        k_offset = k_fp8.shape[0]
+        need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
+        if not need_chunk:
+            logits = sparse_nsa_index_extend_logits(
+                q_fp8=q_fp8[:q_offset],
+                weights=weights[:q_offset],
+                kv_fp8=kv_fp8,
+                metadata=NSAIndexerExtendLogitsMetadata(
+                    k_start=ks[:q_offset],
+                    k_end=ke[:q_offset],
+                ),
+            )
+            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks[:q_offset])
+            topk_result[:q_offset] = raw_topk_result
+            return topk_result
+
+        bytes_per_elem = 4
+        bytes_per_row = k_offset * bytes_per_elem
+        max_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
+        max_rows = min(max_rows, q_offset)
+        global_topk_offset = metadata.attn_metadata.topk_indices_offset
+
+        start = 0
+        while start < q_offset:
+            end = min(start + max_rows, q_offset)
+            logits_chunk = sparse_nsa_index_extend_logits(
+                q_fp8=q_fp8[start:end],
+                weights=weights[start:end],
+                kv_fp8=kv_fp8,
+                metadata=NSAIndexerExtendLogitsMetadata(
+                    k_start=ks[start:end],
+                    k_end=ke[start:end],
+                ),
+            )
+            lengths_chunk = seq_lens_expanded[start:end]
+            if global_topk_offset is not None:
+                topk_offset_chunk = global_topk_offset[start:end]
+                cu_seqlens_q_chunk = None
+                batch_idx_chunk = None
+            else:
+                topk_offset_chunk = None
+                b_chunk = logits_chunk.shape[0]
+                cu_seqlens_q_chunk = torch.ones(
+                    b_chunk, dtype=torch.int32, device=device
+                )
+                batch_idx_chunk = token_to_batch_idx[start:end]
+
+            raw_topk_chunk = metadata.topk_transform(
+                logits_chunk,
+                self.index_topk,
+                ks=ks[start:end],
+                cu_seqlens_q=cu_seqlens_q_chunk,
+                ke_offset=lengths_chunk,
+                batch_idx_list=batch_idx_chunk,
+                topk_indices_offset_override=topk_offset_chunk,
+            )
+            topk_result[start:end] = raw_topk_chunk
+            start = end
+
+        return topk_result
+
+    def _build_b12x_trivial_extend_topk(
+        self,
+        x_meta: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        topk_result = torch.full(
+            (x_meta.shape[0], self.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=x_meta.device,
+        )
+        page_table_1 = metadata.get_page_table_1()
+        seqlens_expanded = metadata.get_seqlens_expanded()
+        row_idx = 0
+        for batch_row, q_len in enumerate(metadata.get_nsa_extend_len_cpu()):
+            for _ in range(q_len):
+                if row_idx >= topk_result.shape[0] or row_idx >= seqlens_expanded.shape[0]:
+                    return topk_result
+                valid = min(
+                    int(seqlens_expanded[row_idx].item()),
+                    page_table_1.shape[1],
+                    self.index_topk,
+                )
+                if valid > 0:
+                    topk_result[row_idx, :valid] = page_table_1[batch_row, :valid]
+                row_idx += 1
+        return topk_result
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -399,6 +636,11 @@ class Indexer(MultiPlatformOp):
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+
+        if self._use_b12x_indexer(forward_batch):
+            return self._get_b12x_paged_topk(
+                forward_batch, layer_id, q_fp8, weights, metadata
+            )
 
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
@@ -534,6 +776,11 @@ class Indexer(MultiPlatformOp):
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
+
+        if self._use_b12x_indexer(forward_batch):
+            return self._get_b12x_ragged_topk(
+                forward_batch, layer_id, q_fp8, weights, metadata
+            )
 
         page_size = forward_batch.token_to_kv_pool.page_size
         if _is_hip:
@@ -726,6 +973,9 @@ class Indexer(MultiPlatformOp):
         # MHA doesn't need topk_indices
         if not return_indices:
             return None
+
+        if self._use_b12x_indexer(forward_batch):
+            return self._build_b12x_trivial_extend_topk(x_meta, metadata)
 
         # MLA: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
