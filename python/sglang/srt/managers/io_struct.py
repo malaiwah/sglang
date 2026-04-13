@@ -2011,3 +2011,20 @@ def _check_all_req_types():
 
 
 _check_all_req_types()
+
+
+# --- Stub classes for unmerged PR compatibility ---
+@dataclass
+class LoadLoRAAdapterReqOutput:
+    success: bool = False
+    message: str = ""
+
+@dataclass
+class LoadLoRAAdapterFromTensorsReqOutput:
+    success: bool = False
+    message: str = ""
+
+@dataclass
+class UnloadLoRAAdapterReqOutput:
+    success: bool = False
+    message: str = ""
