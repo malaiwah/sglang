@@ -274,3 +274,4 @@ sgl-kernel/csrc/**/*_musa/
 *.glb
 *.ply
 *.npz
+docker_run.sh

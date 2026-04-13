@@ -1,11 +1,6 @@
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.srt.configs.linear_attn_model_registry import (
-    get_linear_attn_config,
-    import_backend_class,
-)
-
 logger = logging.getLogger(__name__)
 
 
@@ -107,16 +102,6 @@ def create_triton_backend(runner):
         return TritonAttnBackend(runner)
 
 
-@register_attention_backend("b12x")
-def create_b12x_backend(runner):
-    assert not runner.model_config.is_encoder_decoder, (
-        "Cross attention is not supported in the b12x attention backend."
-    )
-    from sglang.srt.layers.attention.b12x_backend import B12xAttnBackend
-
-    return B12xAttnBackend(runner)
-
-
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -215,16 +200,35 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.layers.attention.linear.utils import (
             initialize_linear_attn_config,
         )
-        from sglang.srt.utils import is_blackwell, is_npu
+        from sglang.srt.utils import (
+            is_blackwell,
+            is_npu,
+            is_sm100_supported,
+        )
 
         check_environments()
         initialize_linear_attn_config(runner.server_args)
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
-                assert runner.server_args.attention_backend in (
-                    "triton", "trtllm_mha", "fa4", "flashinfer", "b12x",
-                ), "triton, trtllm_mha, fa4, flashinfer, or b12x backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend to specify the backend."
-            if is_npu():
+                if is_sm100_supported():
+                    allowed = {"triton", "trtllm_mha"}
+                else:
+                    allowed = {"triton", "trtllm_mha", "fa4", "flashinfer"}
+                attn_be = runner.server_args.attention_backend
+                prefill_be = runner.server_args.prefill_attention_backend
+                decode_be = runner.server_args.decode_attention_backend
+                # When using split prefill/decode backends, check each individually
+                if prefill_be and decode_be:
+                    assert prefill_be in allowed and decode_be in allowed, (
+                        f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
+                        f"Got prefill={prefill_be}, decode={decode_be}."
+                    )
+                else:
+                    assert attn_be in allowed, (
+                        f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
+                        f"Got attention_backend={attn_be}."
+                    )
+            elif is_npu():
                 assert (
                     runner.server_args.attention_backend == "ascend"
                 ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
@@ -237,17 +241,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         elif runner.hybrid_lightning_config is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
-            spec_result = get_linear_attn_config(runner.model_config.hf_config)
-            if spec_result is not None:
-                spec, _ = spec_result
-                BackendClass = import_backend_class(spec.backend_class_name)
-                linear_attn_backend = BackendClass(runner)
-            else:
-                raise ValueError(
-                    "Expected hybrid GDN or NemotronH models, but got unknown model. "
-                    "If this is a custom hybrid model, use register_linear_attn_model() "
-                    "from sglang.srt.configs.linear_attn_model_registry."
-                )
+            raise ValueError(
+                "Expected hybrid GDN or NemotronH models, but got unknown model."
+            )
         full_attn_layers = cfg.full_attention_layer_ids
         return HybridLinearAttnBackend(
             full_attn_backend, linear_attn_backend, full_attn_layers
