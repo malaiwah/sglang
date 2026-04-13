@@ -477,5 +477,25 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestPCIeOneshotAllReduceArgs(CustomTestCase):
+    def test_server_args_default_pcie_oneshot_allreduce_max_size(self):
+        server_args = ServerArgs(model_path="dummy")
+        self.assertEqual(server_args.pcie_oneshot_allreduce_max_size, "64KB")
+
+    def test_prepare_server_args_parses_pcie_oneshot_allreduce_args(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--enable-pcie-oneshot-allreduce",
+                "--pcie-oneshot-allreduce-max-size",
+                "256KB",
+            ]
+        )
+
+        self.assertTrue(server_args.enable_pcie_oneshot_allreduce)
+        self.assertEqual(server_args.pcie_oneshot_allreduce_max_size, "256KB")
+
+
 if __name__ == "__main__":
     unittest.main()

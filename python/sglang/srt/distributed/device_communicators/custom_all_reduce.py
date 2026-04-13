@@ -33,18 +33,11 @@ _is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
 
-_PCIE_BENCHMARK_CEILING = 1024 * 1024
+def parse_pcie_ar_max_size(value: str | int) -> int:
+    """Parse a byte-size string into bytes."""
 
-
-def parse_pcie_ar_max_size(value: str | int | None) -> Optional[int]:
-    """Parse a byte-size string, or return None for ``auto``."""
-
-    if value is None:
-        return None
     if isinstance(value, int):
         return value
-    if value.lower() == "auto":
-        return None
     normalized = value.upper().strip()
     suffixes = {
         "KB": 1024,
@@ -58,25 +51,24 @@ def parse_pcie_ar_max_size(value: str | int | None) -> Optional[int]:
     return int(value)
 
 
-def _get_pcie_oneshot_settings() -> tuple[bool, Optional[int], bool]:
+def _get_pcie_oneshot_settings() -> tuple[bool, int]:
     if not _is_cuda or _is_hip or _is_musa:
-        return False, None, False
+        return False, 0
 
     try:
         from sglang.srt.server_args import get_global_server_args
 
         server_args = get_global_server_args()
     except Exception:
-        return False, None, False
+        return False, 0
 
     enabled = bool(getattr(server_args, "enable_pcie_oneshot_allreduce", False))
     if not enabled:
-        return False, None, False
+        return False, 0
 
-    explicit_max_size = parse_pcie_ar_max_size(
-        getattr(server_args, "pcie_oneshot_allreduce_max_size", "auto")
+    return True, parse_pcie_ar_max_size(
+        getattr(server_args, "pcie_oneshot_allreduce_max_size", "64KB")
     )
-    return True, explicit_max_size, explicit_max_size is None
 
 
 @lru_cache(maxsize=1)
@@ -121,7 +113,6 @@ class CustomAllreduce:
         self.use_amd_deterministic_impl = _use_amd_deterministic_impl()
         self._ptr = 0
         self._pcie_runtime = None
-        self._needs_crossover_bench = False
 
         rank = dist.get_rank(group=group)
         world_size = dist.get_world_size(group=group)
@@ -138,7 +129,7 @@ class CustomAllreduce:
         self.world_size = world_size
         self.max_size = max_size
 
-        pcie_enabled, explicit_pcie_max_size, pcie_auto_size = _get_pcie_oneshot_settings()
+        pcie_enabled, pcie_max_size = _get_pcie_oneshot_settings()
         if not ops.IS_CUSTOM_AR_AVAILABLE and not pcie_enabled:
             # disable because of missing custom allreduce library
             # e.g. in a non-cuda environment
@@ -163,11 +154,7 @@ class CustomAllreduce:
                 )
                 return
 
-            if explicit_pcie_max_size is None:
-                self.max_size = min(max_size, _PCIE_BENCHMARK_CEILING)
-                self._needs_crossover_bench = pcie_auto_size
-            else:
-                self.max_size = min(max_size, explicit_pcie_max_size)
+            self.max_size = min(max_size, pcie_max_size)
 
             self._pcie_runtime = runtime_cls.from_exchange_group(
                 exchange_group=group,

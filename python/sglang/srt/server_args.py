@@ -633,7 +633,7 @@ class ServerArgs:
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     enable_pcie_oneshot_allreduce: bool = False
-    pcie_oneshot_allreduce_max_size: str = "auto"
+    pcie_oneshot_allreduce_max_size: str = "64KB"
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
     pre_warm_nccl: bool = dataclasses.field(
@@ -5731,7 +5731,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.pcie_oneshot_allreduce_max_size,
             help="Maximum message size for the PCIe oneshot all-reduce backend. "
-            "Accepts integers in bytes, K/KB, M/MB, or 'auto'.",
+            "Accepts integers in bytes, K/KB, or M/MB.",
         )
         parser.add_argument(
             "--enable-mscclpp",
