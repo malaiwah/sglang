@@ -6,13 +6,13 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 import triton.language as tl
+from sgl_kernel.utils import is_arch_support_pdl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 from sglang.srt.utils import (
@@ -26,6 +26,14 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+def _mla_decode_kv_splits_cap(base_max_kv_splits: int, sm_count: int) -> int:
+    """Raise max KV split cap, when the batch size is small."""
+    if sm_count <= 0:
+        return base_max_kv_splits
+    cap = next_power_of_2(sm_count * 2)
+    return max(base_max_kv_splits, cap)
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -52,8 +60,6 @@ class ForwardMetadata:
     window_kv_indices: torch.Tensor
     window_num_kv_splits: torch.Tensor
     window_kv_offsets: torch.Tensor
-    # Separate attn_logits for SWA layers when v_head_dim differs
-    swa_attn_logits: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -97,30 +103,16 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
-        # The decode triton kernel derives attn_lse offsets from attn_logits
-        # strides via integer division by v_head_dim (the "// Lv" trick in
-        # _fwd_kernel_stage1/stage2), so attn_logits.shape[-1] must exactly
-        # match the layer's v_head_dim. For hybrid SWA models where SWA and
-        # full-attention layers use different v_head_dim (e.g. Gemma 4:
-        # swa=256, full=512), we allocate a second buffer for SWA layers.
-        full_v_head_dim = model_runner.model_config.v_head_dim
-        swa_v_head_dim = model_runner.model_config.swa_v_head_dim
-        if self.sliding_window_size is not None and swa_v_head_dim != full_v_head_dim:
-            self.v_head_dim = full_v_head_dim
-            self.swa_v_head_dim = swa_v_head_dim
-        elif (
+        if (
             model_runner.hybrid_gdn_config is not None
             or model_runner.kimi_linear_config is not None
-            or model_runner.linear_attn_model_spec is not None
         ):
             # For hybrid linear models, layer_id = 0 may not be full attention
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
-            self.swa_v_head_dim = None
         else:
             self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
                 -1
             ]
-            self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
@@ -128,6 +120,11 @@ class TritonAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        if self.use_mla:
+            self.max_kv_splits = _mla_decode_kv_splits_cap(
+                self.max_kv_splits, self.device_core_count
+            )
+        self.use_pdl = is_arch_support_pdl()
 
         self.allow_bidirectional_attention_in_extend = (
             model_runner.server_args.disable_cuda_graph
@@ -186,7 +183,7 @@ class TritonAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.qo_indptr = torch.zeros(
-                (max_bs + 1,), dtype=torch.int64, device=model_runner.device
+                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
 
             self.mask_indptr = torch.zeros(
@@ -259,7 +256,6 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_indices = None
         window_num_kv_splits = None
         window_kv_offsets = None
-        swa_attn_logits = None
         spec_info = forward_batch.spec_info
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -308,14 +304,6 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.float32,
                 device=self.device,
             )
-            if self.swa_v_head_dim is not None:
-                swa_attn_logits = torch.empty(
-                    (bs, self.num_head, self.max_kv_splits, self.swa_v_head_dim),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-            else:
-                swa_attn_logits = None
             attn_lse = torch.empty(
                 (bs, self.num_head, self.max_kv_splits),
                 dtype=torch.float32,
@@ -462,7 +450,6 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indices,
             window_num_kv_splits,
             window_kv_offsets,
-            swa_attn_logits=swa_attn_logits,
         )
 
     def init_cuda_graph_state(
@@ -477,19 +464,6 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
             device=self.device,
         )
-        if self.swa_v_head_dim is not None:
-            self.cuda_graph_swa_attn_logits = torch.zeros(
-                (
-                    max_num_tokens,
-                    self.num_head,
-                    self.max_kv_splits,
-                    self.swa_v_head_dim,
-                ),
-                dtype=torch.float32,
-                device=self.device,
-            )
-        else:
-            self.cuda_graph_swa_attn_logits = None
         self.cuda_graph_attn_lse = torch.zeros(
             (max_num_tokens, self.num_head, self.max_kv_splits),
             dtype=torch.float32,
@@ -560,7 +534,6 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_indices = None
         window_num_kv_splits = None
         window_kv_offsets = None
-        swa_attn_logits = None
 
         if forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -599,7 +572,6 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
             attn_logits = self.cuda_graph_attn_logits
-            swa_attn_logits = self.cuda_graph_swa_attn_logits
             attn_lse = self.cuda_graph_attn_lse
             max_extend_len = None
             num_kv_splits = self.cuda_graph_num_kv_splits
@@ -701,7 +673,6 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indices,
             window_num_kv_splits,
             window_kv_offsets,
-            swa_attn_logits=swa_attn_logits,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -862,37 +833,35 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        if k is None and v is None:
-            pool = forward_batch.token_to_kv_pool
-            cache_loc = forward_batch.out_cache_loc
-            if isinstance(pool, SWAKVPool) and pool.layers_mapping[layer.layer_id][1]:
-                cache_loc = pool.translate_loc_from_full_to_swa(cache_loc)
-            k_buffer, v_buffer = pool.get_kv_buffer(layer.layer_id)
-            k = k_buffer[cache_loc]
-            v = v_buffer[cache_loc]
-        elif k is None or v is None:
-            raise ValueError("Both k and v should be None or not None")
-        else:
-            # Save KV cache first (must do this before unified kernel)
-            if save_kv_cache:
-                if (
-                    self.use_mla or layer.k_scale is None
-                ):  # Triton MLA currently doesn't support quantized kv cache
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        forward_batch.out_cache_loc,
-                        k,
-                        v,
-                    )
-                else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        forward_batch.out_cache_loc,
-                        k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
-                        v.clone(),
-                        layer.k_scale,
-                        layer.v_scale,
-                    )
+        # Save KV cache first (must do this before unified kernel)
+        if save_kv_cache:
+            if layer.k_scale is None:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                )
+            elif self.use_mla:
+                # For MLA, scale K manually before storing since MLATokenToKVPool
+                # doesn't accept scale parameters. Clone to protect k from mutation
+                # since it's used later in the attention kernel.
+                k_scaled = k.clone().div_(layer.k_scale)
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k_scaled,
+                    v,
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
+                    v.clone(),
+                    layer.k_scale,
+                    layer.v_scale,
+                )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
@@ -1112,7 +1081,12 @@ class TritonAttnBackend(AttentionBackend):
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
         if save_kv_cache:
-            if self.use_mla:  # Triton MLA currently doesn't support quantized kv cache
+            if self.use_mla:
+                if layer.k_scale is not None:
+                    # For MLA, scale K manually before storing since MLATokenToKVPool
+                    # doesn't accept scale parameters. k is not used after this point
+                    # in decode, so in-place mutation is safe.
+                    k = k.clone().div_(layer.k_scale)
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
@@ -1143,16 +1117,6 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        # Select the correctly-sized attn_logits buffer for this layer.
-        # The triton kernel's // Lv stride trick requires attn_logits.shape[-1]
-        # to exactly match the layer's v_head_dim.
-        attn_logits = self.forward_metadata.attn_logits
-        if (
-            self.forward_metadata.swa_attn_logits is not None
-            and layer.v_head_dim == self.swa_v_head_dim
-        ):
-            attn_logits = self.forward_metadata.swa_attn_logits
-
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -1160,7 +1124,7 @@ class TritonAttnBackend(AttentionBackend):
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             kv_indptr,
             kv_indices,
-            attn_logits,
+            self.forward_metadata.attn_logits,
             self.forward_metadata.attn_lse,
             self.forward_metadata.num_kv_splits,
             self.max_kv_splits,
@@ -1170,6 +1134,8 @@ class TritonAttnBackend(AttentionBackend):
             logit_cap=logits_soft_cap,
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
+            has_mla=self.use_mla,
+            use_pdl=self.use_pdl,
         )
         return o
 
