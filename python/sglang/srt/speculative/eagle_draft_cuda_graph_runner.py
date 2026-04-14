@@ -374,9 +374,16 @@ class EAGLEDraftCudaGraphRunner:
 
         bs = self.capture_bs[index]
         if bs != raw_bs:
+            # Padded rows still participate in replay, so clear all per-request inputs
+            # to avoid carrying stale request state across batch-size buckets.
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
             buffers.positions.zero_()
+            buffers.mrope_positions.zero_()
+            buffers.topk_p.zero_()
+            buffers.topk_index.zero_()
+            buffers.hidden_states.zero_()
+            buffers.req_pool_indices.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -386,6 +393,10 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.out_cache_loc
         )
         buffers.positions[:raw_num_token].copy_(forward_batch.positions)
+        if forward_batch.mrope_positions is not None:
+            buffers.mrope_positions[:, :raw_num_token].copy_(
+                forward_batch.mrope_positions
+            )
         buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
