@@ -57,6 +57,60 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import is_npu, use_intel_amx_backend
 
+# --- KLD logit capture patch (injected) ---
+import os as _kld_os
+import threading as _kld_threading
+
+_kld_lock = _kld_threading.Lock()
+_kld_counter = 0
+
+def _kld_maybe_save(input_logits, logits_metadata):
+    """Save full log-softmax logits to disk for KLD evaluation.
+
+    Skips MTP/NextN speculative-head calls (detected via call stack)
+    and DRAFT_EXTEND forward mode to avoid contaminating KLD with
+    speculative-head logits.
+    """
+    global _kld_counter
+    save_dir = _kld_os.environ.get("SGLANG_KLD_SAVE_DIR")
+    if not save_dir:
+        return
+    # Skip MTP draft-extend forward passes (post-decode speculative)
+    if hasattr(logits_metadata, "forward_mode") and hasattr(logits_metadata.forward_mode, "is_draft_extend"):
+        if logits_metadata.forward_mode.is_draft_extend(include_v2=True):
+            return
+    # Skip MTP/NextN model calls during prefill by checking call stack.
+    # MTP heads have their own LogitsProcessor but are called from
+    # model files like qwen3_5_mtp.py or deepseek_nextn.py.
+    import traceback as _tb
+    for _frame in _tb.extract_stack():
+        if "mtp" in _frame.filename.lower() or "nextn" in _frame.filename.lower():
+            return
+    # Only save from rank 0 to avoid duplicates across TP workers
+    try:
+        import torch.distributed
+        rank = torch.distributed.get_rank()
+    except (RuntimeError, ValueError):
+        rank = 0
+    if rank != 0:
+        return
+    # Trim TP padding columns to actual vocab size.
+    # With TP, logits are padded to a multiple of tp_size. The padding columns
+    # are garbage and must be removed before log_softmax.
+    import torch
+    import torch.nn.functional as F
+    vocab_size = int(_kld_os.environ.get("SGLANG_KLD_VOCAB_SIZE", "152064"))
+    logits = input_logits[:, :vocab_size].cpu().float()
+    log_probs = F.log_softmax(logits, dim=-1)
+    from safetensors.torch import save_file
+    with _kld_lock:
+        idx = _kld_counter
+        _kld_counter += 1
+    path = _kld_os.path.join(save_dir, f"{idx}.safetensors")
+    save_file({"log_probs": log_probs}, path)
+    print(f"[KLD] Saved logits {log_probs.shape} to {path}")
+# --- End KLD logit capture patch ---
+
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
@@ -373,6 +427,7 @@ class LogitsProcessor(nn.Module):
             )
             input_logits = logits[input_logprob_indices]
             del logits
+            _kld_maybe_save(input_logits, logits_metadata)
 
             logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
         else:

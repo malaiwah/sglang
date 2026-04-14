@@ -226,6 +226,21 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+    def enter_torch_compile(self, num_tokens: int):
+        if self.is_torch_compile:
+            return
+
+        self._original_forward_method = self._forward_method
+        # Keep the CUDA indexer path opaque to Dynamo. The b12x/CuTe runtime
+        # uses DLPack and JIT launch plumbing that is not fake-tensor traceable.
+        self._forward_method = torch.compiler.disable(self.forward_cuda)
+        self.is_torch_compile = True
+
+    def forward_native(self, *args, **kwargs):
+        # torch.compile routes MultiPlatformOp modules through forward_native().
+        # The NSA indexer still needs its custom CUDA path in that mode.
+        return self.forward_cuda(*args, **kwargs)
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -472,7 +487,19 @@ class Indexer(MultiPlatformOp):
             page_size=forward_batch.token_to_kv_pool.page_size,
             contract_phantoms=phantoms,
         )
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        topk_kwargs = {}
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        ):
+            # b12x paged verify/draft-extend currently score against an expanded
+            # per-query page table. The fused paged top-k transform therefore needs
+            # a matching expanded query grouping instead of the batch-grouped
+            # extend-style cu_seqlens_q stored in the attention metadata.
+            topk_kwargs["cu_seqlens_q_cumsum"] = metadata.attn_metadata.nsa_cu_seqlens_q[
+                : q_offset + 1
+            ]
+        topk_result = metadata.topk_transform(logits, self.index_topk, **topk_kwargs)
         if q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
             padding = torch.full(

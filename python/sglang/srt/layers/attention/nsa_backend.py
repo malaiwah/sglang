@@ -228,6 +228,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         topk: int,
         ks: Optional[torch.Tensor] = None,
         cu_seqlens_q: torch.Tensor = None,
+        cu_seqlens_q_cumsum: torch.Tensor = None,
         ke_offset: torch.Tensor = None,
         batch_idx_list: List[int] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
@@ -241,6 +242,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         if topk_indices_offset_override is not None:
             cu_topk_indices_offset = topk_indices_offset_override
             cu_seqlens_q_topk = None
+        elif cu_seqlens_q_cumsum is not None:
+            cu_seqlens_q_topk = cu_seqlens_q_cumsum.to(torch.int32)
+            cu_topk_indices_offset = None
         elif cu_seqlens_q is not None:
             cu_seqlens_q = cu_seqlens_q.to(torch.int32)
             cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
@@ -469,6 +473,7 @@ class NativeSparseAttnBackend(
         self.b12x_workspaces[workspace_mode] = workspace
         return workspace
 
+    @torch.compiler.disable
     def _forward_b12x(
         self,
         *,
@@ -580,25 +585,29 @@ class NativeSparseAttnBackend(
             cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
             seqlens_expanded = cache_seqlens_int32
         elif forward_batch.forward_mode.is_target_verify():
-            max_seqlen_q = 1
-            cu_seqlens_q = torch.arange(
-                0,
-                batch_size * self.speculative_num_draft_tokens + 1,
-                1,
+            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+            extend_seq_lens = torch.full(
+                (batch_size,),
+                self.speculative_num_draft_tokens,
                 dtype=torch.int32,
                 device=device,
             )
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+            max_seqlen_q = self.speculative_num_draft_tokens
+            cu_seqlens_q = compute_cu_seqlens(extend_seq_lens)
+            forward_batch.extend_seq_lens = extend_seq_lens
             forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+            forward_batch.extend_num_tokens = int(extend_seq_lens.sum().item())
+            indexer_seq_lens_cpu = forward_batch.seq_lens_cpu + self.speculative_num_draft_tokens
+            indexer_seq_lens = cache_seqlens_int32
 
             seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
+                extend_seq_lens,
                 cache_seqlens_int32,
                 self.speculative_num_draft_tokens * batch_size,
                 self.speculative_num_draft_tokens,
             )
             page_table = torch.repeat_interleave(
-                page_table, repeats=self.speculative_num_draft_tokens, dim=0
+                page_table, repeats=extend_seq_lens, dim=0
             )
         elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
             assert (
@@ -1013,7 +1022,7 @@ class NativeSparseAttnBackend(
                 torch.int32
             )
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
-            max_seqlen_q = 1
+            max_seqlen_q = self.speculative_num_draft_tokens
             page_table_1 = self.decode_cuda_graph_metadata["page_table"][
                 : bs * self.speculative_num_draft_tokens, :
             ]
@@ -1021,8 +1030,8 @@ class NativeSparseAttnBackend(
 
             cu_seqlens_q = torch.arange(
                 0,
-                bs * self.speculative_num_draft_tokens + 1,
-                1,
+                (bs + 1) * self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -1051,7 +1060,7 @@ class NativeSparseAttnBackend(
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
                 seqlens_expanded, nsa_index_topk=self.nsa_index_topk
             )
-            nsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
+            nsa_extend_seq_lens_list = extend_seq_lens_cpu
 
             if self.nsa_decode_impl == "flashmla_kv":
                 flashmla_metadata = self.decode_cuda_graph_metadata[
@@ -1503,14 +1512,20 @@ class NativeSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "NSA is causal only"
 
-        nsa_impl = (
-            self.nsa_decode_impl
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and self.nsa_prefill_impl == "b12x"
+        ):
+            nsa_impl = self.nsa_prefill_impl
+        else:
+            nsa_impl = (
+                self.nsa_decode_impl
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                )
+                else self.nsa_prefill_impl
             )
-            else self.nsa_prefill_impl
-        )
 
         if nsa_impl == "trtllm" and not self.use_mha:
             return self._forward_trtllm(
