@@ -383,6 +383,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         forward_batch.return_hidden_states_before_norm = True
 
         # Construct input_ids
+        # TODO: same chunked-prefill chain divergence as PR #26329.
         if not batch.forward_mode.is_idle():
             rotate_input_ids_triton(
                 forward_batch.input_ids,

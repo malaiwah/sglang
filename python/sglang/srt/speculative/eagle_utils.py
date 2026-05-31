@@ -3,6 +3,10 @@ from enum import IntEnum
 from typing import List, Optional
 
 import torch
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -14,6 +18,22 @@ if _is_cuda or _is_hip:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+
+def _eagle_prefill_tail_tokens(
+    batch: "ScheduleBatch", next_token_ids: torch.Tensor
+) -> torch.Tensor:
+    """Per-seq tail token for EAGLE prefill rotation; uses next prompt token for
+    non-final chunks (chunked-prefill chain consistency, see PR #26329)."""
+    tail_tokens = next_token_ids.to(batch.input_ids.dtype)
+    next_prompt_token = batch.chunked_req_next_prompt_token
+    if next_prompt_token is not None:
+        for i, r in enumerate(batch.reqs):
+            if r is batch.chunked_req:
+                tail_tokens = tail_tokens.clone()
+                tail_tokens[i] = next_prompt_token
+                break
+    return tail_tokens
 
 
 def organize_draft_results(
