@@ -683,6 +683,9 @@ class ModelRunnerKVCacheMixin:
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    enable_kv_cache_copy=(
+                        self.server_args.speculative_algorithm is not None
+                    ),
                     use_mla=self.use_mla_backend,
                     quant_method=hybrid_quant_method,
                     start_layer=self.start_layer,

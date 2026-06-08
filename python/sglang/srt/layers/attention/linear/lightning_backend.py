@@ -38,6 +38,17 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # seg_la processes draft tokens as a chain -- it has no parent-indices
+        # plumbing for tree-shaped drafts, so spec v2 tree verify (topk > 1) would
+        # commit wrong mamba states silently. Fail fast instead of mis-decoding.
+        # (ported from upstream #27463; getattr: our base class sets topk only
+        # for spec runs, and conv_states_shape is omitted -- different pool API)
+        if getattr(self, "topk", 1) > 1:
+            raise NotImplementedError(
+                "Lightning (seg_la) linear-attention backend does not support "
+                "speculative decoding with topk > 1; seg_la verifies a draft "
+                "tree as a chain. Use --speculative-eagle-topk 1."
+            )
 
         assert not (
             model_runner.sliding_window_size is not None
