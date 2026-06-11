@@ -616,7 +616,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             return effort not in (None, "none", "no_think")
         if self.template_manager.force_reasoning:
             return True
-        config = self.template_manager.reasoning_config
+        # April-tree TemplateManager has no reasoning_config (template-based
+        # thinking-toggle detection landed later); None takes the parser-only path
+        config = getattr(self.template_manager, "reasoning_config", None)
         if config is None:
             # Parser-only models (DeepSeek-R1, …) carry the thinking default in
             # the detector itself.
