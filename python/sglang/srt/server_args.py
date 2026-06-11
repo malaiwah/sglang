@@ -445,7 +445,8 @@ class ServerArgs:
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
-    strip_thinking_cache: bool = False
+    # NOTE: upstream's strip_thinking_cache field omitted — its feature commit
+    # is not in this tree and a field without an argparse arg breaks from_cli_args
     enable_strict_thinking: bool = False
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
