@@ -2551,6 +2551,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
             reqs=self.reqs,
+            chunked_req_next_prompt_token=self.chunked_req_next_prompt_token,
+            chunked_req_index=(
+                self.reqs.index(self.chunked_req)
+                if (self.chunked_req is not None and self.chunked_req in self.reqs)
+                else -1
+            ),
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
@@ -2752,6 +2758,10 @@ class ModelWorkerBatch:
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
+    # EAGLE chunked-prefill draft-chain (upstream #26800, adapted: our worker
+    # path receives ModelWorkerBatch, so the field rides along with an index)
+    chunked_req_next_prompt_token: Optional[int] = None
+    chunked_req_index: int = -1
     has_grammar: bool = False
 
     # For hidden states before normal

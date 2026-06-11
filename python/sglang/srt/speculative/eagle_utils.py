@@ -29,13 +29,17 @@ def _eagle_prefill_tail_tokens(
     """Per-seq tail token for EAGLE prefill rotation; uses next prompt token for
     non-final chunks (chunked-prefill chain consistency, see PR #26329)."""
     tail_tokens = next_token_ids.to(batch.input_ids.dtype)
-    next_prompt_token = batch.chunked_req_next_prompt_token
+    next_prompt_token = getattr(batch, "chunked_req_next_prompt_token", None)
     if next_prompt_token is not None:
-        for i, r in enumerate(batch.reqs):
-            if r is batch.chunked_req:
-                tail_tokens = tail_tokens.clone()
-                tail_tokens[i] = next_prompt_token
-                break
+        idx = getattr(batch, "chunked_req_index", -1)
+        if idx < 0 and getattr(batch, "chunked_req", None) is not None:
+            for i, r in enumerate(batch.reqs or []):
+                if r is batch.chunked_req:
+                    idx = i
+                    break
+        if 0 <= idx < tail_tokens.shape[0]:
+            tail_tokens = tail_tokens.clone()
+            tail_tokens[idx] = next_prompt_token
     return tail_tokens
 
 
