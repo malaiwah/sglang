@@ -265,8 +265,18 @@ class EagleVerifyInputV2Mixin:
                 req_pool_idx_tensor = batch.req_pool_indices.to(
                     device=mapping.device, dtype=torch.int64
                 )
+                # Guard (upstream PR #27324, issue #27325): mamba_next_track_idx
+                # may be None for requests that haven't allocated a ping-pong
+                # buffer yet (spec v2 verify path). Default to slot 0 — the
+                # mapping yields the no-allocation marker and downstream
+                # track-masking skips the request instead of crashing.
                 track_col_idx = torch.tensor(
-                    [req.mamba_next_track_idx for req in batch.reqs],
+                    [
+                        req.mamba_next_track_idx
+                        if req.mamba_next_track_idx is not None
+                        else 0
+                        for req in batch.reqs
+                    ],
                     dtype=torch.int64,
                     pin_memory=True,
                 ).to(mapping.device, non_blocking=True)
