@@ -1908,17 +1908,36 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
-        # Create shared parameters
-        copy_or_rebind_param(
-            layer,
-            "g1_alphas",
-            (w13_input_scale * w13_weight_scale_2).to(torch.float32),
+        # Create shared parameters.
+        # W4A16 (B12X_MOE_FORCE_A16): the b12x MoE kernel consumes full-precision
+        # bf16 activations (apply() rejects packed NVFP4 activations), so there is
+        # NO activation-quant scale to cancel against. The per-expert alpha must be
+        # the WEIGHT global scale alone -- this matches the b12x w4a16 contract
+        # (weight = fp4 * blockscale * weight_global_scale; see b12x
+        # tests/test_w4a16_e2e.py). Folding input_scale in (the W4A4 contract) is
+        # uncompensated here: it makes alpha ~1e-4x too small, prepare then inflates
+        # the fp8 blockscales past range -> FC1 overflows to inf -> routed-expert
+        # output collapses to exactly 0.0 (only the shared expert survives ->
+        # incoherent "token salad"). Dense layers (first_k_dense_replace) are
+        # unaffected. Verified: GLM-5.2-NVFP4-REAP, 4xRTX6000 sm120, GSM8K 96.5%.
+        import os as _os_w4a16
+        _b12x_force_a16 = (
+            get_moe_runner_backend().is_b12x()
+            and _os_w4a16.environ.get("B12X_MOE_FORCE_A16", "0")
+            not in ("0", "", "false", "False")
         )
-        copy_or_rebind_param(
-            layer,
-            "g2_alphas",
-            (w2_input_scale * layer.w2_weight_scale_2).to(torch.float32),
-        )
+        if _b12x_force_a16:
+            _g1_alphas = (
+                torch.ones_like(w13_input_scale) * w13_weight_scale_2
+            ).to(torch.float32)
+            _g2_alphas = (
+                torch.ones_like(w2_input_scale) * layer.w2_weight_scale_2
+            ).to(torch.float32)
+        else:
+            _g1_alphas = (w13_input_scale * w13_weight_scale_2).to(torch.float32)
+            _g2_alphas = (w2_input_scale * layer.w2_weight_scale_2).to(torch.float32)
+        copy_or_rebind_param(layer, "g1_alphas", _g1_alphas)
+        copy_or_rebind_param(layer, "g2_alphas", _g2_alphas)
         copy_or_rebind_param(
             layer,
             "w13_input_scale_quant",
