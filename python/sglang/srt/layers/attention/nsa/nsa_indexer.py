@@ -604,8 +604,15 @@ class Indexer(MultiPlatformOp):
                 )
 
         # NOTE(dark): logits should be cleaned in topk_transform
+        # DCP Stage 2: the logits were computed with RANK-LOCAL seqlens (only owned columns valid;
+        # b12x doesn't clean beyond -> [local, global) is GARBAGE). topk_transform must use the LOCAL
+        # seqlens as `lengths` (ke_offset) or it considers garbage columns -> wrong slots, which mis-
+        # indexed sequences at bs>1 (needle 1/2). seqlens_32 is already rank-local here when sharding.
         topk_result = metadata.topk_transform(
-            logits, self.index_topk, page_table_1_override=local_pt1_override
+            logits,
+            self.index_topk,
+            ke_offset=(seqlens_32 if local_pt1_override is not None else None),
+            page_table_1_override=local_pt1_override,
         )
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
