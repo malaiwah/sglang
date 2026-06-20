@@ -77,6 +77,39 @@ def merge_cp_decode_output(out_local, lse_local, *, cp_group=None, gathered=None
     return merged
 
 
+def merge_cp_reduce_scatter(out_local, lse_local, *, cp_group, rank, h_local):
+    """vLLM-style merge (cp_lse_ag_out_rs): all-gather LSE (tiny) + reduce_scatter the weighted
+    output -> each rank gets ONLY its TP head shard, summed across CP. Moves cp× LESS data than the
+    all-gather merge_cp_decode_output (which gathers every rank's full [rows,H,V] then slices), and
+    drops the per-layer torch.stack + merge-kernel + num_chunks H2D. Identical online-softmax math.
+
+    out_local : [rows, H_all, V] this rank's ALL-head partial over its KV shard.
+    lse_local : [rows, H_all] fp32 base-2 LSE (lse_scale="base2"); -inf rows contribute 0.
+    Returns [rows, h_local, V] (this rank's TP heads of the exact global attention). cuda-graph-safe
+    (no host->device copy). This is THE prefill win: 1024-row merge traffic drops 4×.
+    """
+    import torch.distributed as _dist
+    cp = _dist.get_world_size(cp_group)
+    rows, H, V = out_local.shape
+    # 1) all-gather the small LSE to form the global normalizer (base-2 logsumexp over CP).
+    lg = [torch.empty_like(lse_local) for _ in range(cp)]
+    _dist.all_gather(lg, lse_local.contiguous(), group=cp_group)
+    lse_all = torch.stack(lg, dim=0)                      # [cp, rows, H] fp32
+    gmax = lse_all.amax(dim=0)                            # [rows, H]
+    gmax = torch.where(torch.isfinite(gmax), gmax, gmax.new_zeros(()))
+    glse = gmax + torch.log2(torch.exp2(lse_all - gmax).sum(dim=0))  # [rows, H]
+    # 2) this rank's softmax weight (0 where its LSE is -inf), apply to its all-H partial.
+    w = torch.exp2(lse_local - glse)                     # [rows, H]
+    # weight in fp32 for precision, cast back to out dtype (bf16) so reduce_scatter sums in the
+    # attention output dtype the caller expects (cuda-graph asserts the out dtype).
+    weighted = (out_local * w.unsqueeze(-1)).to(out_local.dtype)   # [rows, H, V]
+    # 3) reduce_scatter over the HEAD axis: out_shard = sum_cp(weighted_cp)[:, my_heads, :].
+    chunks = [c.contiguous() for c in weighted.chunk(cp, dim=1)]  # cp × [rows, h_local, V]
+    out_shard = torch.empty_like(chunks[rank])
+    _dist.reduce_scatter(out_shard, chunks, group=cp_group)
+    return out_shard
+
+
 # --------------------------------------------------------------------------- indexer merge
 def _local_topk(logits, lengths, topk, *, use_b12x):
     """Per-row local top-k over a [rows, width] fp32 tile. Returns (vals[rows,topk], idx[rows,topk])."""

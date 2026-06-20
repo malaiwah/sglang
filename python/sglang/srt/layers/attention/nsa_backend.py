@@ -792,6 +792,7 @@ class NativeSparseAttnBackend(
         from b12x.integration.mla import sparse_mla_decode_forward
         from sglang.srt.layers.attention.nsa.cp_nsa import (
             merge_cp_decode_output,
+            merge_cp_reduce_scatter,
             page_owned_local_selection,
         )
 
@@ -849,10 +850,9 @@ class NativeSparseAttnBackend(
         lse_r[empty] = float("-inf")  # unconditional masked write — no host sync (perf #1)
 
         # 4) LSE-merge the per-rank all-H partials -> exact global all-H attention
-        merged = merge_cp_decode_output(o_r, lse_r, cp_group=pg,
-                                        num_chunks=self._cp_num_chunks)  # [rows, h_all, v]
-        # 5) reduce-scatter: keep only this rank's TP head shard
-        return merged[:, rank * h_local:(rank + 1) * h_local, :].contiguous()
+        # 4+5) merge + reduce-scatter in one (vLLM cp_lse_ag_out_rs): each rank gets its TP
+        # heads directly, moving cp× less data than the all-gather merge.
+        return merge_cp_reduce_scatter(o_r, lse_r, cp_group=pg, rank=rank, h_local=h_local)
 
     def _extend_dcp(
         self,
@@ -872,6 +872,7 @@ class NativeSparseAttnBackend(
         from b12x.integration.mla import sparse_mla_extend_forward
         from sglang.srt.layers.attention.nsa.cp_nsa import (
             merge_cp_decode_output,
+            merge_cp_reduce_scatter,
             page_owned_local_selection,
         )
 
@@ -921,9 +922,9 @@ class NativeSparseAttnBackend(
         o_r = o_r.reshape(rows, h_all, v_head_dim)
         lse_r = lse_r.reshape(rows, h_all).float()
         lse_r[empty] = float("-inf")  # unconditional masked write — no host sync (perf #1)
-        merged = merge_cp_decode_output(o_r, lse_r, cp_group=pg,
-                                        num_chunks=self._cp_num_chunks)
-        return merged[:, rank * h_local:(rank + 1) * h_local, :].contiguous()
+        # vLLM-style merge: all-gather LSE (tiny) + reduce_scatter the weighted output. THIS is
+        # the prefill fix — 1024-row merge traffic drops 4× + no stack/merge-kernel per layer.
+        return merge_cp_reduce_scatter(o_r, lse_r, cp_group=pg, rank=rank, h_local=h_local)
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size
