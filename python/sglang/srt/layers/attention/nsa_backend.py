@@ -356,6 +356,12 @@ class NativeSparseAttnBackend(
             self.dcp_rank = _gatr()
             self.dcp_attn_tp_group = _gatg()
             self.dcp_group = getattr(_gatg(), "device_group", None)
+            # cuda-graph-safe constant: the merge's num_chunks_ptr is just [dcp]. Build it ONCE
+            # here on-device — a per-call torch.tensor([cp], device=cuda) is a host->device copy
+            # that is ILLEGAL during cuda-graph capture (the capture blocker we hit).
+            self._cp_num_chunks = torch.tensor(
+                [self.dcp_size], device=model_runner.device, dtype=torch.int32
+            )
         # Step B (default): the latent pool is physically sharded /dcp -> per-rank-local
         # slot remap in decode. Step A (=0): replicated pool, decode-only correctness A/B.
         self.dcp_shard_pool = self.dcp_enabled and _os_dcp.environ.get(
@@ -843,7 +849,8 @@ class NativeSparseAttnBackend(
         lse_r[empty] = float("-inf")  # unconditional masked write — no host sync (perf #1)
 
         # 4) LSE-merge the per-rank all-H partials -> exact global all-H attention
-        merged = merge_cp_decode_output(o_r, lse_r, cp_group=pg)  # [rows, h_all, v]
+        merged = merge_cp_decode_output(o_r, lse_r, cp_group=pg,
+                                        num_chunks=self._cp_num_chunks)  # [rows, h_all, v]
         # 5) reduce-scatter: keep only this rank's TP head shard
         return merged[:, rank * h_local:(rank + 1) * h_local, :].contiguous()
 
@@ -914,7 +921,8 @@ class NativeSparseAttnBackend(
         o_r = o_r.reshape(rows, h_all, v_head_dim)
         lse_r = lse_r.reshape(rows, h_all).float()
         lse_r[empty] = float("-inf")  # unconditional masked write — no host sync (perf #1)
-        merged = merge_cp_decode_output(o_r, lse_r, cp_group=pg)
+        merged = merge_cp_decode_output(o_r, lse_r, cp_group=pg,
+                                        num_chunks=self._cp_num_chunks)
         return merged[:, rank * h_local:(rank + 1) * h_local, :].contiguous()
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:

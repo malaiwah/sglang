@@ -31,7 +31,8 @@ _SUPPORTED_TOPK = (512, 1024, 2048)
 
 
 # --------------------------------------------------------------------------- attention merge
-def merge_cp_decode_output(out_local, lse_local, *, cp_group=None, gathered=None):
+def merge_cp_decode_output(out_local, lse_local, *, cp_group=None, gathered=None,
+                           num_chunks=None):
     """Combine per-CP-rank partial sparse-MLA decode outputs into the exact global output.
 
     out_local : [rows, H, V] (bf16/fp16) — this rank's attention over the selected tokens IT owns,
@@ -65,7 +66,10 @@ def merge_cp_decode_output(out_local, lse_local, *, cp_group=None, gathered=None
     # chunk axis (dim 2) holds the cp shards; the merge reads it by stride (arbitrary stride ok).
     tmp_output = torch.stack(og, dim=2).contiguous()        # [rows, H, cp, V]
     tmp_lse = torch.stack(lg, dim=2).contiguous().float()   # [rows, H, cp]
-    num_chunks = torch.tensor([cp], device=out_local.device, dtype=torch.int32)
+    # num_chunks is the constant [cp]; the caller passes a cached on-device tensor on the
+    # cuda-graph path (a fresh torch.tensor([cp], device=cuda) is a capture-illegal H2D copy).
+    if num_chunks is None:
+        num_chunks = torch.tensor([cp], device=out_local.device, dtype=torch.int32)
     merged = torch.empty(rows, H, V, device=out_local.device, dtype=tmp_output.dtype)
     run_sparse_mla_split_decode_merge(
         tmp_output=tmp_output, tmp_lse=tmp_lse, num_chunks_ptr=num_chunks, output=merged,
