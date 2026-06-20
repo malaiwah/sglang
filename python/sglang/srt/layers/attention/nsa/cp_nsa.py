@@ -197,12 +197,10 @@ def page_owned_local_selection(page_table_1, nsa_seqlens, dcp_rank, dcp_size, pa
     # Step B (sharded pool): remap to the compacted per-rank-local slot. Step A (replicated
     # pool, remap_local=False): keep the original GLOBAL slot (isolates decode correctness).
     local = (((pg // dcp_size) * page_size + (pt % page_size)) if remap_local else pt).to(torch.int32)
-    out = torch.full((rows, W), -1, device=dev, dtype=torch.int32)
-    counts = torch.zeros(rows, device=dev, dtype=torch.int32)
-    for r in range(rows):
-        sl = local[r][owned[r]]
-        n = int(sl.numel())
-        if n:
-            out[r, :n] = sl
-        counts[r] = n
+    # Vectorized compaction (was a per-row Python loop — the prefill perf killer): a stable
+    # argsort by NOT-owned brings each row's owned entries to the front, -1 pads the rest.
+    order = torch.argsort((~owned).to(torch.int8), dim=1, stable=True)
+    local_owned = torch.where(owned, local, local.new_full((), -1))
+    out = torch.gather(local_owned, 1, order).contiguous()
+    counts = owned.sum(dim=1).to(torch.int32)
     return out, counts
