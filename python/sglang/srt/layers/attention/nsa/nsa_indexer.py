@@ -810,6 +810,12 @@ class Indexer(MultiPlatformOp):
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
+            # NOTE: do NOT pass batch_idx_list here. The prefill topk kernel
+            # (topk_transform_prefill_kernel, topk.cu:301-329) indexes page_table_size_1 by SEQUENCE
+            # via cu_seqlens_q (per-sequence cumulative) with a RELATIVE column (col - row_start), so
+            # the per-SEQUENCE local_pt1 [B_seq, ...] is already correct. Passing batch_idx_list would
+            # expand it to Q rows and trip TORCH_CHECK(src_page_table.size(0)==prefill_bs) -> crash.
+            # (Verified against the real csrc/elementwise/topk.cu by the dcp-fix workflow.)
             raw_topk_result = metadata.topk_transform(
                 logits,
                 self.index_topk,

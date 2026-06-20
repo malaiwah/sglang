@@ -1604,6 +1604,16 @@ class MLATokenToKVPool(KVCache):
             if self._dcp_size > 1
             else self.size
         )
+        # DCP non-owned-write scratch slot (CRITICAL bug fix). Non-owned tokens must NOT be written
+        # to LOCAL slot 0: only GLOBAL page 0 is the allocator's reserved null, and under page
+        # sharding local_page 0 maps to physical page `rank` on ranks>=1 — a REAL token slot. Writing
+        # scratch there clobbered the first token of whichever sequence lived in local_page 0,
+        # corrupting one sequence per non-owning rank at concurrency (needle 1/2@conc2, 0/4@conc4).
+        # The latent buffer has a +page_size tail (see _create_buffers), so its LAST row is always
+        # above the max valid local slot AND inside the buffer -> a guaranteed-safe never-read scratch.
+        self._latent_scratch_slot = (
+            (self._latent_buf_size + self.page_size - 1) if self._dcp_size > 1 else 0
+        )
 
         self._create_buffers()
 
@@ -1705,12 +1715,13 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         if getattr(self, "_dcp_size", 1) > 1:
-            # DCP: GLOBAL slot -> per-rank-LOCAL latent slot (page-ownership); non-owned -> 0.
+            # DCP: GLOBAL slot -> per-rank-LOCAL latent slot (page-ownership). Non-owned -> the
+            # reserved tail scratch slot (NOT local slot 0, which is a real token on ranks>=1).
             _p = loc // self.page_size
             loc = torch.where(
                 (_p % self._dcp_size) == self._dcp_rank,
                 (_p // self._dcp_size) * self.page_size + (loc % self.page_size),
-                torch.zeros_like(loc),
+                torch.full_like(loc, self._latent_scratch_slot),
             )
 
         if self.nsa_kv_cache_store_fp8:
@@ -1887,12 +1898,13 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     ):
         layer_id = layer.layer_id
         if getattr(self, "_dcp_size", 1) > 1:
-            # DCP: GLOBAL slot -> per-rank-LOCAL latent slot (page-ownership); non-owned -> 0.
+            # DCP: GLOBAL slot -> per-rank-LOCAL latent slot (page-ownership). Non-owned -> the
+            # reserved tail scratch slot (NOT local slot 0, which is a real token on ranks>=1).
             _p = loc // self.page_size
             loc = torch.where(
                 (_p % self._dcp_size) == self._dcp_rank,
                 (_p // self._dcp_size) * self.page_size + (loc % self.page_size),
-                torch.zeros_like(loc),
+                torch.full_like(loc, self._latent_scratch_slot),
             )
 
         if self.nsa_kv_cache_store_fp8:
@@ -1992,10 +2004,20 @@ class NSATokenToKVPool(MLATokenToKVPool):
             and _os_idx.environ.get("SGLANG_NSA_DCP_SHARD_INDEX", "0")
             not in ("0", "", "false", "False")
         )
+        self._index_scratch_slot = 0
         if self._shard_index:
             index_buf_size = (
                 index_buf_size + self._dcp_size - 1
             ) // self._dcp_size
+            # Reserve a guaranteed-safe scratch page for non-owned-write remap (same critical bug as
+            # the latent pool). The READ path can address local slots up to
+            # _max_local_page = (ceil(global_size/ps)-1)//dcp ; size the buffer to cover that PLUS a
+            # dedicated spare page, and put the scratch slot in the spare page (never read).
+            _max_local_page = (
+                (self.size + self.page_size - 1) // self.page_size - 1
+            ) // self._dcp_size
+            self._index_scratch_slot = (_max_local_page + 1) * self.page_size
+            index_buf_size = max(index_buf_size, (_max_local_page + 2) * self.page_size)
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
 
@@ -2032,10 +2054,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
     def dcp_remap_index_loc(self, loc: torch.Tensor) -> torch.Tensor:
         """DCP Stage 2: GLOBAL token slot -> per-rank-LOCAL index_k slot (page-ownership).
-        owner(page)=page%dcp; non-owned tokens map to local slot 0 (a scratch slot; same
-        convention as the latent set_mla_kv_buffer remap). No-op when index sharding is off.
-        Used by the WRITE path (_store_index_k_cache) so each rank only persists the tokens
-        whose page it owns into its /dcp-sized index_k buffer.
+        owner(page)=page%dcp. Non-owned tokens map to a RESERVED tail scratch slot
+        (self._index_scratch_slot), NOT local slot 0 — on ranks>=1 local slot 0 is a real token, so
+        writing scratch there corrupted real tokens at concurrency. No-op when index sharding is off.
+        Used by the WRITE path (_store_index_k_cache) so each rank only persists the tokens whose page
+        it owns into its /dcp-sized index_k buffer.
         """
         if not getattr(self, "_shard_index", False):
             return loc
@@ -2043,7 +2066,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         return torch.where(
             (_p % self._dcp_size) == self._dcp_rank,
             (_p // self._dcp_size) * self.page_size + (loc % self.page_size),
-            torch.zeros_like(loc),
+            torch.full_like(loc, self._index_scratch_slot),
         )
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
