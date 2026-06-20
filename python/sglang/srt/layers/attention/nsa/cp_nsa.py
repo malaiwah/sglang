@@ -193,6 +193,80 @@ def two_stage_global_topk(local_logits, lengths, cp_rank, cp_size, topk, *,
     return out_g   # [rows, topk] global token ids (-1 where fewer than topk total)
 
 
+def two_stage_global_topk_paged(logits, local_seqlens, local_real_pt, dcp_rank,
+                                dcp_size, page_size, topk, *, cp_group=None,
+                                gathered=None, use_b12x=True, gid_deterministic=True):
+    """DCP Stage-2 DECODE: global top-k in GLOBAL KV-SLOT space from RANK-LOCAL paged logits.
+
+    Stage-2 keeps index_k sharded /dcp, so each rank scored ONLY its owned pages: `logits`
+    [rows, Wlocal] fp32 is over this rank's COMPACTED local page table `local_real_pt`
+    [rows, Pl] int32 (owned local page ids, -1 padded; from dcp_local_index_paged_tables).
+    Only the first `local_seqlens[row]` logit columns are valid. This helper produces the
+    GLOBAL top-k (identical on every rank) as GLOBAL physical KV slots — the SAME format as
+    Stage-1's topk_transform output — so _decode_dcp can reuse page_owned_local_selection.
+
+    Slot mapping (inverse of the latent/index_k page shard: owner(g)=g%dcp, local=g//dcp):
+        logit column c  ->  local page  lp = local_real_pt[c // page_size]   (lp<0 => padding)
+                            offset       off = c % page_size
+                            global page  gp = lp * dcp_size + dcp_rank
+                            global slot  gs = gp * page_size + off
+
+    Steps: per-row local top-k (vals, col) over `logits` masked to `local_seqlens`; map col ->
+    global slot (col<0 or lp<0 => -1); all_gather(vals) + all_gather(global_slots) over the DCP
+    group; cat -> [rows, dcp*topk]; push padding (slot<0) to -inf; tie-break sort by (-score,
+    slot) (matches two_stage_global_topk's determinism); take topk -> global_slots.
+
+    Returns global_slots [rows, topk] int32 (GLOBAL physical KV slots, -1 padded), identical on
+    every rank. cuda-graph-safe: pure tensor ops + one collective; dcp*topk is static.
+    """
+    rows, Wlocal = logits.shape
+    dev = logits.device
+    # 1) per-row local top-k over the owned columns (mask to local_seqlens inside _local_topk)
+    vals, col = _local_topk(logits, local_seqlens, topk, use_b12x=use_b12x)   # [rows, topk]
+    # 2) local logit column -> GLOBAL physical KV slot
+    col64 = col.to(torch.int64)                                               # -1 for padding
+    Pl = local_real_pt.shape[1]
+    pidx = torch.clamp(col64 // page_size, min=0, max=Pl - 1)                 # [rows, topk]
+    off = col64 % page_size
+    lp = torch.gather(local_real_pt.to(torch.int64), 1, pidx)                 # local page id (-1 pad)
+    gp = lp * dcp_size + dcp_rank                                             # global page id
+    gslot = torch.where(
+        (col64 >= 0) & (lp >= 0),
+        gp * page_size + off,
+        col64.new_full((), -1),
+    ).to(torch.int64)                                                        # [rows, topk]
+    # 3) all-gather candidate (score, global_slot) over the DCP group
+    if gathered is None:
+        if cp_group is None or not torch.distributed.is_initialized():
+            raise ValueError("two_stage_global_topk_paged needs cp_group + initialized "
+                             "distributed, or a precomputed `gathered` list")
+        cp = torch.distributed.get_world_size(cp_group)
+        vg = [torch.empty_like(vals) for _ in range(cp)]
+        sg = [torch.empty_like(gslot) for _ in range(cp)]
+        torch.distributed.all_gather(vg, vals.contiguous(), group=cp_group)
+        torch.distributed.all_gather(sg, gslot.contiguous(), group=cp_group)
+    else:
+        vg = [v for v, _ in gathered]
+        sg = [s for _, s in gathered]
+        cp = len(vg)
+    cand_v = torch.cat(vg, dim=1)   # [rows, cp*topk]
+    cand_s = torch.cat(sg, dim=1)   # [rows, cp*topk]
+    # 4) drop padding (slot<0) by pushing to -inf
+    cand_v = torch.where(cand_s >= 0, cand_v, cand_v.new_full((), float("-inf")))
+    # 5) deterministic merge: tie-break by (-score, slot) (sort slot asc stable, then score desc)
+    if gid_deterministic:
+        order_s0 = torch.argsort(cand_s, dim=1, stable=True)
+        cand_v = torch.gather(cand_v, 1, order_s0)
+        cand_s = torch.gather(cand_s, 1, order_s0)
+        order_v = torch.argsort(-cand_v, dim=1, stable=True)
+        sel = order_v[:, :topk]
+        out_s = torch.gather(cand_s, 1, sel)
+    else:
+        _, sel = torch.topk(cand_v, topk, dim=1)
+        out_s = torch.gather(cand_s, 1, sel)
+    return out_s.to(torch.int32)   # [rows, topk] GLOBAL KV slots (-1 padded), same on all ranks
+
+
 def owned_local_selection(global_topk_gids, cp_rank, cp_size):
     """From the global top-k token ids, return THIS rank's owned subset as rank-local slots.
 

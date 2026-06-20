@@ -823,19 +823,17 @@ class NativeSparseAttnBackend(
         h_all = q_gathered.shape[1]  # == h_local * dcp == num_attention_heads
 
         # 2) page-level owned selection (+ global->local slot remap when pool is sharded)
+        # DCP Stage 2 now produces a GLOBAL top-k (global KV slots, identical on every rank) just
+        # like Stage 1 (the indexer merges its rank-local top-k via a candidate all-gather), so BOTH
+        # stages take the same carve: page_owned_local_selection slices this rank's owned pages and
+        # (when the latent pool is sharded) remaps global->local slots. nsa_cache_seqlens_int32 is
+        # the global valid count (min(seqlen, topk)); the (ar<nsa)&(pt>=0) guard inside tolerates
+        # rows with fewer than nsa valid global-topk entries.
         nsa = metadata.nsa_cache_seqlens_int32
-        if getattr(self, "dcp_shard_index", False):
-            # DCP Stage 2: the indexer already scored ONLY this rank's owned pages and returned
-            # rank-LOCAL latent slots (front-packed, -1 padded). Use them directly — do NOT run
-            # page_owned_local_selection (it assumes a GLOBAL selection replicated on every rank,
-            # which is false under per-rank-local top-k). owned_cnt = valid (non-negative) count.
-            owned_pt = page_table_1.clone()  # private copy: we mutate empty rows below
-            owned_cnt = (page_table_1 >= 0).sum(dim=1).to(torch.int32)
-        else:
-            owned_pt, owned_cnt = page_owned_local_selection(
-                page_table_1, nsa, rank, dcp, self.real_page_size,
-                remap_local=self.dcp_shard_pool,
-            )
+        owned_pt, owned_cnt = page_owned_local_selection(
+            page_table_1, nsa, rank, dcp, self.real_page_size,
+            remap_local=self.dcp_shard_pool,
+        )
         # owned_pt is already [rows, W] and contiguous (page_owned_local_selection gathers over
         # the full W columns and returns .contiguous()): the old pad branch was dead and the extra
         # .contiguous() a redundant rows×W copy/layer. Dropped (perf #4).
@@ -910,16 +908,15 @@ class NativeSparseAttnBackend(
         h_all = q_gathered.shape[1]
 
         nsa = metadata.nsa_cache_seqlens_int32
-        if getattr(self, "dcp_shard_index", False):
-            # DCP Stage 2: the ragged indexer already scored only this rank's owned pages and
-            # returned rank-LOCAL slots (front-packed, -1 padded) -> use directly (see _decode_dcp).
-            owned_pt = page_table_1.clone()
-            owned_cnt = (page_table_1 >= 0).sum(dim=1).to(torch.int32)
-        else:
-            owned_pt, owned_cnt = page_owned_local_selection(
-                page_table_1, nsa, rank, dcp, self.real_page_size,
-                remap_local=self.dcp_shard_pool,
-            )
+        # DCP Stage 2: page_table_1 is now a GLOBAL top-k (the skip path returns global dense slots;
+        # the ragged shard branch merges its rank-local top-k into a global one — same as decode), so
+        # BOTH stages take Stage-1's carve. page_owned_local_selection slices this rank's owned pages
+        # and (sharded pool) remaps global->local slots. (Was: a per-rank-local bypass that treated
+        # the global slots as local -> corrupted the prompt encoding -> garbage decode.)
+        owned_pt, owned_cnt = page_owned_local_selection(
+            page_table_1, nsa, rank, dcp, self.real_page_size,
+            remap_local=self.dcp_shard_pool,
+        )
         # owned_pt already [rows, W] + contiguous (see _decode_dcp): pad branch dead, extra
         # .contiguous() redundant -> dropped (perf #4).
         empty = owned_cnt == 0

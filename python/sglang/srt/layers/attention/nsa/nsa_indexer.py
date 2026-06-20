@@ -451,10 +451,14 @@ class Indexer(MultiPlatformOp):
 
         # DCP Stage 2: when the index_k pool is sharded /dcp, the indexer must score ONLY this
         # rank's owned pages. Remap the GLOBAL (block_tables, seqlens) -> RANK-LOCAL page tables +
-        # owned token counts, and carry a token-level LOCAL slot table for topk_transform so the
-        # selected columns map straight to LOCAL latent slots (consumed as-is by _decode_dcp, which
-        # bypasses page_owned_local_selection in this mode). Cuda-graph-safe (pure tensor ops).
+        # owned token counts. The logits are then computed over the rank-LOCAL block_tables, but the
+        # SELECTION is made GLOBAL: a candidate all-gather over the DCP group merges the rank-local
+        # top-k into the GLOBAL top-k in GLOBAL KV-SLOT space (see the shard branch after the logits
+        # below). This produces a [q, index_topk] int32 of GLOBAL slots IDENTICAL in format to the
+        # Stage-1 (non-shard) topk_transform output, so _decode_dcp reuses page_owned_local_selection.
+        # Cuda-graph-safe (pure tensor ops + one collective; dcp*index_topk*bs is static).
         local_pt1_override = None
+        _local_real_pt = None
         _pool = forward_batch.token_to_kv_pool
         if getattr(_pool, "_shard_index", False) and not _is_verify_or_draft:
             from sglang.srt.layers.attention.nsa.cp_nsa import (
@@ -464,6 +468,9 @@ class Indexer(MultiPlatformOp):
             block_tables, seqlens_32, local_pt1_override = dcp_local_index_paged_tables(
                 block_tables, seqlens_32, _pool._dcp_rank, _pool._dcp_size, page_size
             )
+            # block_tables is now this rank's COMPACTED local page table (local_real_pt); keep a
+            # handle for the global-slot remap of the selected columns after the logits.
+            _local_real_pt = block_tables
             max_seq_len = block_tables.shape[1] * page_size
             # the precomputed schedule_metadata was built for GLOBAL seqlens -> force a rebuild
             # from the rank-local seqlens below.
@@ -604,16 +611,37 @@ class Indexer(MultiPlatformOp):
                 )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        # DCP Stage 2: the logits were computed with RANK-LOCAL seqlens (only owned columns valid;
-        # b12x doesn't clean beyond -> [local, global) is GARBAGE). topk_transform must use the LOCAL
-        # seqlens as `lengths` (ke_offset) or it considers garbage columns -> wrong slots, which mis-
-        # indexed sequences at bs>1 (needle 1/2). seqlens_32 is already rank-local here when sharding.
-        topk_result = metadata.topk_transform(
-            logits,
-            self.index_topk,
-            ke_offset=(seqlens_32 if local_pt1_override is not None else None),
-            page_table_1_override=local_pt1_override,
-        )
+        if _local_real_pt is not None:
+            # DCP Stage 2 (GLOBAL selection): the logits were computed over this rank's RANK-LOCAL
+            # page table, so a plain top-k would be rank-local. Instead merge the rank-local top-k
+            # into the GLOBAL top-k in GLOBAL KV-SLOT space via a single candidate all-gather over
+            # the DCP group. The result is [q, index_topk] int32 of GLOBAL slots (-1 padded),
+            # IDENTICAL in format to the Stage-1 topk_transform output -> _decode_dcp's
+            # page_owned_local_selection carves each rank's owned share verbatim. seqlens_32 is the
+            # rank-LOCAL owned-token count (the valid logit-column count) here.
+            from sglang.srt.layers.attention.nsa.cp_nsa import (
+                two_stage_global_topk_paged,
+            )
+            from sglang.srt.layers.dp_attention import (
+                get_attention_tp_group as _dcp_gatg,
+            )
+
+            _dcp_pg = getattr(_dcp_gatg(), "device_group", None)
+            topk_result = two_stage_global_topk_paged(
+                logits,
+                seqlens_32,
+                _local_real_pt,
+                _pool._dcp_rank,
+                _pool._dcp_size,
+                page_size,
+                self.index_topk,
+                cp_group=_dcp_pg,
+            )
+        else:
+            topk_result = metadata.topk_transform(
+                logits,
+                self.index_topk,
+            )
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
