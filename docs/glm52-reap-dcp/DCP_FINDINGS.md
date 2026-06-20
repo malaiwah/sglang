@@ -111,3 +111,6 @@ core math is already validated (M1 probes); the remainder is serving-path engine
   context — drop `chunked-prefill-size` (→1024–2048) and `max-running-requests` (→1–2) to free it.
 - Needle/long-prefill answers land in `reasoning_content`; give `max_tokens` ≥ a few-k or `content`
   comes back empty.
+
+## cp2 fragility under load (another reason non-CP wins here)
+DCP serving coherence is confirmed on fresh single requests (correct Rayleigh-scattering answer, "144/12=12"). But under *sustained concurrent* load (GSM8K, 2-4 workers x multi-k reasoning), the cp2 server entered a persistent error state — its pool is only ~26k tokens (weights replicate at attn_tp=1), so concurrent reasoning answers hit the known NSA/b12x memory-pressure stability edge (UPSTREAM_MAP #4) much sooner than non-CP's ~144k pool. Single-request DCP correctness is intact; this is a capacity/stability limit, not a DCP math bug — and one more reason non-CP is the operating sweet spot on the 469B.
