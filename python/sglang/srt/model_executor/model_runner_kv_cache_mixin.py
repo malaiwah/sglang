@@ -95,6 +95,23 @@ class ModelRunnerKVCacheMixin:
                     * kv_size
                 )
 
+            # DCP Stage 1: the LATENT kv_buffer is physically sharded /dcp across the attn-TP
+            # ranks (index_k replicated). Per-rank per-GLOBAL-token bytes = latent/dcp + indexer,
+            # so max_total (= rest_memory // cell_size) grows ~latent_frac×dcp. THIS file sizes
+            # the pool (profile_max_num_token); pool_configurator is a separate/unused path here.
+            import os as _os_dcpm
+            from sglang.srt.layers.dp_attention import (
+                get_attention_tp_size as _datps,
+            )
+            if (
+                _os_dcpm.environ.get("SGLANG_NSA_DECODE_DCP", "0")
+                not in ("0", "", "false", "False")
+                and _os_dcpm.environ.get("SGLANG_NSA_DCP_SHARD_POOL", "1")
+                not in ("0", "", "false", "False")
+                and _datps() > 1
+            ):
+                cell_size = cell_size // _datps()  # latent only; indexer added next (replicated)
+
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
             if is_deepseek_nsa(self.model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)

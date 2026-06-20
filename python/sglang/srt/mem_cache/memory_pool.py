@@ -1575,6 +1575,36 @@ class MLATokenToKVPool(KVCache):
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
+        # vLLM-style DCP: physically shard the LATENT kv_buffer /dcp across the attn-TP ranks
+        # (each rank stores 1/dcp of the global tokens by PAGE: owner(page)=page%dcp). self.size
+        # stays the GLOBAL token count (allocator + index_k); only the latent buffer is sized
+        # /dcp and set/get remap global->local. Validated mapping: tpxdcp_decode_probe.py.
+        import os as _os_dcpp
+        self._dcp_size = 1
+        self._dcp_rank = 0
+        if (
+            use_nsa
+            and _os_dcpp.environ.get("SGLANG_NSA_DECODE_DCP", "0")
+            not in ("0", "", "false", "False")
+            and _os_dcpp.environ.get("SGLANG_NSA_DCP_SHARD_POOL", "1")
+            not in ("0", "", "false", "False")
+        ):
+            try:
+                from sglang.srt.layers.dp_attention import (
+                    get_attention_tp_rank as _dtpr,
+                    get_attention_tp_size as _dtps,
+                )
+
+                self._dcp_size = _dtps()
+                self._dcp_rank = _dtpr()
+            except Exception:
+                self._dcp_size = 1
+        self._latent_buf_size = (
+            ((self.size + self._dcp_size - 1) // self._dcp_size)
+            if self._dcp_size > 1
+            else self.size
+        )
+
         self._create_buffers()
 
         self.data_ptrs = torch.tensor(
@@ -1594,9 +1624,11 @@ class MLATokenToKVPool(KVCache):
                 else nullcontext()
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                # DCP: per-rank latent buffer is sized /dcp (self._latent_buf_size); the global
+                # slot space (self.size) is unchanged.
                 self.kv_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        (self._latent_buf_size + self.page_size, 1, self.kv_cache_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -1672,6 +1704,14 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         layer_id = layer.layer_id
+        if getattr(self, "_dcp_size", 1) > 1:
+            # DCP: GLOBAL slot -> per-rank-LOCAL latent slot (page-ownership); non-owned -> 0.
+            _p = loc // self.page_size
+            loc = torch.where(
+                (_p % self._dcp_size) == self._dcp_rank,
+                (_p // self._dcp_size) * self.page_size + (loc % self.page_size),
+                torch.zeros_like(loc),
+            )
 
         if self.nsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
@@ -1846,6 +1886,14 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_k_rope: torch.Tensor,
     ):
         layer_id = layer.layer_id
+        if getattr(self, "_dcp_size", 1) > 1:
+            # DCP: GLOBAL slot -> per-rank-LOCAL latent slot (page-ownership); non-owned -> 0.
+            _p = loc // self.page_size
+            loc = torch.where(
+                (_p % self._dcp_size) == self._dcp_rank,
+                (_p // self._dcp_size) * self.page_size + (loc % self.page_size),
+                torch.zeros_like(loc),
+            )
 
         if self.nsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here

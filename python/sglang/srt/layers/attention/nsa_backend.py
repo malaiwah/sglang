@@ -333,6 +333,35 @@ class NativeSparseAttnBackend(
         )
         self.q_dtype = model_runner.dtype
 
+        # --- vLLM-style decode-context-parallel (DCP) ---------------------------------
+        # Shard the latent KV pool across the attention-TP ranks while KEEPING attn_tp
+        # (heads stay TP-sharded) — the vLLM mechanism, which avoids SGLang attn_cp's
+        # attn_tp=1 weight-replication tax. DCP group == the attention-TP group
+        # (dcp_size == attn_tp). Env-gated; non-CP path byte-identical when off.
+        # Decode flow (validated tpxdcp_decode_probe.py, cos 0.999994):
+        #   all_gather q over heads -> each rank decodes ALL heads over its OWN KV shard
+        #   (return_lse) -> LSE-merge across ranks -> reduce-scatter heads back to attn_tp.
+        import os as _os_dcp
+        self.dcp_enabled = _os_dcp.environ.get("SGLANG_NSA_DECODE_DCP", "0") not in (
+            "0", "", "false", "False",
+        )
+        self.dcp_size = get_attention_tp_size() if self.dcp_enabled else 1
+        self.dcp_rank = 0
+        self.dcp_group = None
+        if self.dcp_enabled and self.dcp_size > 1:
+            from sglang.srt.layers.dp_attention import (
+                get_attention_tp_group as _gatg,
+                get_attention_tp_rank as _gatr,
+            )
+            self.dcp_rank = _gatr()
+            self.dcp_attn_tp_group = _gatg()
+            self.dcp_group = getattr(_gatg(), "device_group", None)
+        # Step B (default): the latent pool is physically sharded /dcp -> per-rank-local
+        # slot remap in decode. Step A (=0): replicated pool, decode-only correctness A/B.
+        self.dcp_shard_pool = self.dcp_enabled and _os_dcp.environ.get(
+            "SGLANG_NSA_DCP_SHARD_POOL", "1"
+        ) not in ("0", "", "false", "False")
+
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -437,6 +466,7 @@ class NativeSparseAttnBackend(
         total_q: int,
         batch: int,
         v_head_dim: int,
+        num_q_heads_override: int = 0,
     ):
         # b12x 0.20.0 removed MLAWorkspace.for_fixed_capacity; the new lifecycle is
         # caps -> plan_sparse_mla_scratch -> allocate a scratch buffer -> plan.bind().
@@ -447,7 +477,11 @@ class NativeSparseAttnBackend(
         )
 
         workspace_mode = "verify" if mode == "target_verify" else mode
-        holder = self.b12x_workspaces.get(workspace_mode)
+        _nqh = num_q_heads_override or self.num_q_heads
+        # cache key carries the head count (all-H DCP scratch is separate); the b12x caps
+        # `mode=` MUST stay a valid mode string ("decode"/"extend"/"verify").
+        holder_key = workspace_mode if _nqh == self.num_q_heads else f"{workspace_mode}_h{_nqh}"
+        holder = self.b12x_workspaces.get(holder_key)
         if (
             holder is not None
             and holder["max_total_q"] >= total_q
@@ -461,7 +495,7 @@ class NativeSparseAttnBackend(
 
         caps = B12XSparseMLAScratchCaps(
             device=self.device,
-            num_q_heads=self.num_q_heads,
+            num_q_heads=_nqh,
             max_q_rows=max(total_q, 1),
             max_width=self.nsa_index_topk,
             dtype=self.q_dtype,
@@ -481,7 +515,7 @@ class NativeSparseAttnBackend(
             "max_total_q": max(total_q, 1),
             "max_batch": max(batch, 1),
         }
-        self.b12x_workspaces[workspace_mode] = holder
+        self.b12x_workspaces[holder_key] = holder
         return holder
 
     def _forward_b12x(
@@ -545,6 +579,18 @@ class NativeSparseAttnBackend(
             # output. Active only when cp_size>1; byte-identical to the legacy path
             # otherwise. SGLANG_NSA_DECODE_CP=0 forces the full per-rank decode (for
             # A/B isolation of the merge at the same attn_tp=1 layout).
+            # vLLM-style DCP (keep attn_tp): shard the latent KV pool across the TP ranks,
+            # all-gather q over heads, decode all-H over the owned shard, merge, head-slice.
+            # Takes precedence over the legacy attn_cp path when SGLANG_NSA_DECODE_DCP is set.
+            if self.dcp_enabled and self.dcp_size > 1:
+                return self._decode_dcp(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    metadata=metadata,
+                    sm_scale=sm_scale,
+                    v_head_dim=v_head_dim,
+                )
             import os as _os_cp
             try:
                 from sglang.srt.layers.dp_attention import (
@@ -609,6 +655,18 @@ class NativeSparseAttnBackend(
                     pass
             return _o_dec
 
+        # vLLM-style DCP for EXTEND/prefill: each rank extends over its OWNED selected KV shard
+        # (return_lse), then LSE-merge across ranks + head reduce-scatter — required so the
+        # prefill attention is correct over the /dcp-sharded latent pool.
+        if self.dcp_enabled and self.dcp_size > 1:
+            return self._extend_dcp(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                metadata=metadata,
+                sm_scale=sm_scale,
+                v_head_dim=v_head_dim,
+            )
         # b12x 0.20.0: extend resolves the binding exactly like decode —
         # binding.selected_indices is mapped to `selected_token_offsets` inside
         # sparse_mla_extend_forward (_resolve_sparse_mla_binding, selected_name=
@@ -708,6 +766,161 @@ class NativeSparseAttnBackend(
         if bool(empty.any()):
             lse_r[empty] = float("-inf")
         return merge_cp_decode_output(o_r, lse_r, cp_group=pg)
+
+    def _decode_dcp(
+        self,
+        *,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        metadata: NSAMetadata,
+        sm_scale: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        """vLLM-style decode context-parallel (KEEP attn_tp). `q_all` is THIS rank's TP head
+        shard [rows, num_q_heads, head_dim]; the latent KV pool is sharded /dcp (Step B) or
+        replicated (Step A). Flow (validated tpxdcp_decode_probe.py, cos 0.999994):
+          all_gather q over heads -> decode ALL heads over this rank's OWNED selected slots
+          (page-ownership) with return_lse -> LSE-merge across dcp -> slice this rank's heads.
+        """
+        import torch.nn.functional as _F
+        from b12x.integration.mla import sparse_mla_decode_forward
+        from sglang.srt.layers.attention.nsa.cp_nsa import (
+            merge_cp_decode_output,
+            page_owned_local_selection,
+        )
+
+        dcp = self.dcp_size
+        rank = self.dcp_rank
+        pg = self.dcp_group
+        rows = q_all.shape[0]
+        h_local = q_all.shape[1]
+
+        # 1) all-gather q over the head axis -> all-H query replicated on every rank
+        q_gathered = self.dcp_attn_tp_group.all_gather(q_all.contiguous(), dim=1)
+        h_all = q_gathered.shape[1]  # == h_local * dcp == num_attention_heads
+
+        # 2) page-level owned selection (+ global->local slot remap when pool is sharded)
+        nsa = metadata.nsa_cache_seqlens_int32
+        owned_pt, owned_cnt = page_owned_local_selection(
+            page_table_1, nsa, rank, dcp, self.real_page_size,
+            remap_local=self.dcp_shard_pool,
+        )
+        W = page_table_1.shape[1]
+        if owned_pt.shape[1] < W:
+            owned_pt = _F.pad(owned_pt, (0, W - owned_pt.shape[1]), value=-1)
+        owned_pt = owned_pt.contiguous()
+        empty = owned_cnt == 0
+        if bool(empty.any()):
+            # empty-owner rows: read dummy slot 0 (valid), discard via lse=-inf after.
+            owned_pt[empty, 0] = 0
+        safe_cnt = torch.where(empty, torch.ones_like(owned_cnt), owned_cnt)
+
+        # 3) decode ALL heads over this rank's owned KV shard (all-H scratch), return LSE
+        ws = self._get_b12x_workspace(
+            mode="decode",
+            total_q=rows,
+            batch=metadata.cache_seqlens_int32.shape[0],
+            v_head_dim=v_head_dim,
+            num_q_heads_override=h_all,
+        )
+        binding = ws["plan"].bind(
+            scratch=ws["buf"],
+            q=q_gathered,
+            selected_indices=owned_pt,
+            cache_seqlens_int32=metadata.cache_seqlens_int32,
+            nsa_cache_seqlens_int32=safe_cnt,
+        )
+        o_r, lse_r = sparse_mla_decode_forward(
+            kv_cache=kv_cache,
+            binding=binding,
+            sm_scale=sm_scale,
+            v_head_dim=v_head_dim,
+            return_lse=True,
+            lse_scale="base2",
+        )
+        o_r = o_r.reshape(rows, h_all, v_head_dim)
+        lse_r = lse_r.reshape(rows, h_all).float()
+        if bool(empty.any()):
+            lse_r[empty] = float("-inf")
+
+        # 4) LSE-merge the per-rank all-H partials -> exact global all-H attention
+        merged = merge_cp_decode_output(o_r, lse_r, cp_group=pg)  # [rows, h_all, v]
+        # 5) reduce-scatter: keep only this rank's TP head shard
+        return merged[:, rank * h_local:(rank + 1) * h_local, :].contiguous()
+
+    def _extend_dcp(
+        self,
+        *,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        metadata: NSAMetadata,
+        sm_scale: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        """vLLM-style DCP for the EXTEND/prefill path. Mirrors _decode_dcp but uses the b12x
+        extend kernel; rows = total_q query tokens. Each rank extends ALL heads over its OWNED
+        selected KV shard (page-ownership, return_lse) -> LSE-merge across dcp -> head slice.
+        """
+        import torch.nn.functional as _F
+        from b12x.integration.mla import sparse_mla_extend_forward
+        from sglang.srt.layers.attention.nsa.cp_nsa import (
+            merge_cp_decode_output,
+            page_owned_local_selection,
+        )
+
+        dcp = self.dcp_size
+        rank = self.dcp_rank
+        pg = self.dcp_group
+        rows = q_all.shape[0]
+        h_local = q_all.shape[1]
+
+        q_gathered = self.dcp_attn_tp_group.all_gather(q_all.contiguous(), dim=1)
+        h_all = q_gathered.shape[1]
+
+        nsa = metadata.nsa_cache_seqlens_int32
+        owned_pt, owned_cnt = page_owned_local_selection(
+            page_table_1, nsa, rank, dcp, self.real_page_size,
+            remap_local=self.dcp_shard_pool,
+        )
+        W = page_table_1.shape[1]
+        if owned_pt.shape[1] < W:
+            owned_pt = _F.pad(owned_pt, (0, W - owned_pt.shape[1]), value=-1)
+        owned_pt = owned_pt.contiguous()
+        empty = owned_cnt == 0
+        if bool(empty.any()):
+            owned_pt[empty, 0] = 0
+        safe_cnt = torch.where(empty, torch.ones_like(owned_cnt), owned_cnt)
+
+        ws = self._get_b12x_workspace(
+            mode="extend",
+            total_q=rows,
+            batch=metadata.cache_seqlens_int32.shape[0],
+            v_head_dim=v_head_dim,
+            num_q_heads_override=h_all,
+        )
+        binding = ws["plan"].bind(
+            scratch=ws["buf"],
+            q=q_gathered,
+            selected_indices=owned_pt,
+            cache_seqlens_int32=metadata.cache_seqlens_int32,
+            nsa_cache_seqlens_int32=safe_cnt,
+        )
+        o_r, lse_r = sparse_mla_extend_forward(
+            kv_cache=kv_cache,
+            binding=binding,
+            sm_scale=sm_scale,
+            v_head_dim=v_head_dim,
+            return_lse=True,
+            lse_scale="base2",
+        )
+        o_r = o_r.reshape(rows, h_all, v_head_dim)
+        lse_r = lse_r.reshape(rows, h_all).float()
+        if bool(empty.any()):
+            lse_r[empty] = float("-inf")
+        merged = merge_cp_decode_output(o_r, lse_r, cp_group=pg)
+        return merged[:, rank * h_local:(rank + 1) * h_local, :].contiguous()
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size

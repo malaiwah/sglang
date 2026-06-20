@@ -169,3 +169,40 @@ def owned_local_selection(global_topk_gids, cp_rank, cp_size):
         out[r, :n] = sl
         counts[r] = n
     return out, counts
+
+
+def page_owned_local_selection(page_table_1, nsa_seqlens, dcp_rank, dcp_size, page_size,
+                               remap_local=True):
+    """vLLM-style DCP (keep attn_tp): PAGE-level KV ownership + global->local-slot remap.
+
+    page_table_1 : [rows, W] int32 GLOBAL physical KV slots (the indexer-selected top-k, the SAME
+                   on every rank because Stage-1 keeps index_k replicated; -1 / >=valid is padding).
+    nsa_seqlens  : [rows] int32 — valid selected count per row (front-valid).
+    Ownership is by PAGE: owner(slot) = (slot // page_size) % dcp_size  (interleave=page_size=64,
+    matching the sharded latent pool's set-path remap). Owned slot's rank-local position in the
+    compacted per-rank buffer is local = (slot // page_size // dcp_size) * page_size + slot % page_size.
+
+    Returns (owned_local [rows, W] int32 padded with -1 at the front-valid prefix, owned_count [rows]
+    int32). Feed owned_local as selected_indices and owned_count as nsa_cache_seqlens to this rank's
+    sparse_mla_decode_forward over its LOCAL latent shard. Exactly the mapping validated in
+    tpxdcp_decode_probe.py (cos 0.999994).
+    """
+    rows, W = page_table_1.shape
+    dev = page_table_1.device
+    pt = page_table_1.to(torch.int64)
+    ar = torch.arange(W, device=dev).unsqueeze(0)
+    valid = (ar < nsa_seqlens.to(torch.int64).unsqueeze(1)) & (pt >= 0)
+    pg = pt // page_size
+    owned = valid & ((pg % dcp_size) == dcp_rank)
+    # Step B (sharded pool): remap to the compacted per-rank-local slot. Step A (replicated
+    # pool, remap_local=False): keep the original GLOBAL slot (isolates decode correctness).
+    local = (((pg // dcp_size) * page_size + (pt % page_size)) if remap_local else pt).to(torch.int32)
+    out = torch.full((rows, W), -1, device=dev, dtype=torch.int32)
+    counts = torch.zeros(rows, device=dev, dtype=torch.int32)
+    for r in range(rows):
+        sl = local[r][owned[r]]
+        n = int(sl.numel())
+        if n:
+            out[r, :n] = sl
+        counts[r] = n
+    return out, counts
