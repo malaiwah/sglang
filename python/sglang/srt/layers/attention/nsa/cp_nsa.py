@@ -99,7 +99,15 @@ def merge_cp_reduce_scatter(out_local, lse_local, *, cp_group, rank, h_local):
     gmax = torch.where(torch.isfinite(gmax), gmax, gmax.new_zeros(()))
     glse = gmax + torch.log2(torch.exp2(lse_all - gmax).sum(dim=0))  # [rows, H]
     # 2) this rank's softmax weight (0 where its LSE is -inf), apply to its all-H partial.
-    w = torch.exp2(lse_local - glse)                     # [rows, H]
+    # NaN GUARD (dcp-fix workflow): an all-(-inf) row/head (NO rank attended any selected token for
+    # that query — owned_cnt=0 on every rank) gives glse=-inf, and exp2(lse_local-glse)=exp2(-inf-(-inf))
+    # =exp2(NaN)=NaN, which poisons the residual stream. Force such rows to weight 0 (finite, contributes
+    # nothing) instead of NaN.
+    w = torch.where(
+        torch.isfinite(glse),
+        torch.exp2(lse_local - glse),
+        torch.zeros_like(glse),
+    )                                                    # [rows, H]
     # weight in fp32 for precision, cast back to out dtype (bf16) so reduce_scatter sums in the
     # attention output dtype the caller expects (cuda-graph asserts the out dtype).
     weighted = (out_local * w.unsqueeze(-1)).to(out_local.dtype)   # [rows, H, V]
