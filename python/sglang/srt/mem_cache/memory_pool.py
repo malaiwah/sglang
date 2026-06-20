@@ -1978,6 +1978,24 @@ class NSATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         if index_buf_size is None:
             index_buf_size = size
+        # DCP Stage 2: physically shard the indexer index_k pool /dcp by PAGE, mirroring the
+        # latent kv_buffer (owner(page)=page%dcp; local_page=page//dcp). This is THE fix for the
+        # O(context^2) prefill tail (the replicated indexer was the root cause) AND the capacity
+        # win (~4x/809k). Gated separately from latent sharding so it can be A/B'd. Requires the
+        # READ path (_get_topk_paged/_get_topk_ragged) to feed rank-local page tables + seqlens,
+        # and the WRITE path (_store_index_k_cache + set_index_k_scale_buffer) to remap global->local.
+        import os as _os_idx
+        # DEFAULT OFF: Stage 2 is opt-in (SGLANG_NSA_DCP_SHARD_INDEX=1) until end-to-end
+        # validated, so the shipped image/config keeps the proven Stage-1 behavior.
+        self._shard_index = (
+            getattr(self, "_dcp_size", 1) > 1
+            and _os_idx.environ.get("SGLANG_NSA_DCP_SHARD_INDEX", "0")
+            not in ("0", "", "false", "False")
+        )
+        if self._shard_index:
+            index_buf_size = (
+                index_buf_size + self._dcp_size - 1
+            ) // self._dcp_size
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
 
@@ -2011,6 +2029,22 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 for _ in range(layer_num)
             ]
         self._finalize_allocation_log(size)
+
+    def dcp_remap_index_loc(self, loc: torch.Tensor) -> torch.Tensor:
+        """DCP Stage 2: GLOBAL token slot -> per-rank-LOCAL index_k slot (page-ownership).
+        owner(page)=page%dcp; non-owned tokens map to local slot 0 (a scratch slot; same
+        convention as the latent set_mla_kv_buffer remap). No-op when index sharding is off.
+        Used by the WRITE path (_store_index_k_cache) so each rank only persists the tokens
+        whose page it owns into its /dcp-sized index_k buffer.
+        """
+        if not getattr(self, "_shard_index", False):
+            return loc
+        _p = loc // self.page_size
+        return torch.where(
+            (_p % self._dcp_size) == self._dcp_rank,
+            (_p // self._dcp_size) * self.page_size + (loc % self.page_size),
+            torch.zeros_like(loc),
+        )
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:

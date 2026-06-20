@@ -440,16 +440,38 @@ class Indexer(MultiPlatformOp):
         )
 
         blocksize = page_size
-        if (
+        _is_verify_or_draft = (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
-        ):
+        )
+        if _is_verify_or_draft:
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
-        # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
-        # otherwise fall back to computing it here.
-        schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+
+        # DCP Stage 2: when the index_k pool is sharded /dcp, the indexer must score ONLY this
+        # rank's owned pages. Remap the GLOBAL (block_tables, seqlens) -> RANK-LOCAL page tables +
+        # owned token counts, and carry a token-level LOCAL slot table for topk_transform so the
+        # selected columns map straight to LOCAL latent slots (consumed as-is by _decode_dcp, which
+        # bypasses page_owned_local_selection in this mode). Cuda-graph-safe (pure tensor ops).
+        local_pt1_override = None
+        _pool = forward_batch.token_to_kv_pool
+        if getattr(_pool, "_shard_index", False) and not _is_verify_or_draft:
+            from sglang.srt.layers.attention.nsa.cp_nsa import (
+                dcp_local_index_paged_tables,
+            )
+
+            block_tables, seqlens_32, local_pt1_override = dcp_local_index_paged_tables(
+                block_tables, seqlens_32, _pool._dcp_rank, _pool._dcp_size, page_size
+            )
+            max_seq_len = block_tables.shape[1] * page_size
+            # the precomputed schedule_metadata was built for GLOBAL seqlens -> force a rebuild
+            # from the rank-local seqlens below.
+            schedule_metadata = None
+        else:
+            # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
+            # otherwise fall back to computing it here.
+            schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
         if _is_cuda and schedule_metadata is None:
             # b12x metadata builder (sm120-native) — deep_gemm's asserts on sm120.
             if __import__("os").environ.get("SGLANG_NSA_B12X_LOGITS", "1") == "1":
@@ -582,7 +604,9 @@ class Indexer(MultiPlatformOp):
                 )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        topk_result = metadata.topk_transform(
+            logits, self.index_topk, page_table_1_override=local_pt1_override
+        )
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
@@ -704,14 +728,51 @@ class Indexer(MultiPlatformOp):
         if batch_size == 0:
             return topk_result
 
-        ks, ke = metadata.get_indexer_kvcache_range()
+        # DCP Stage 2 (prefill): when index_k is sharded /dcp, build rank-LOCAL block tables, ks/ke,
+        # per-query effective lengths, and a token->local-slot table. Each rank scores ONLY its owned
+        # pages (~/dcp of context) -> the O(context^2) indexer tail drops ~4x. Eager path, no cuda-graph.
+        _pool_r = forward_batch.token_to_kv_pool
+        _shard_r = getattr(_pool_r, "_shard_index", False)
+        local_pt1_override = None
+        seqlens_expanded_r = None
+        if _shard_r:
+            # Compute rank-local ragged metadata ONCE per forward (it depends only on the page table +
+            # seq lens, same for every F-layer). Per-layer recompute is ~18x slower (44 vs ~1420 tok/s)
+            # — the GPU-only metadata ops don't pipeline well across the dependent gather/logits/topk.
+            # Cache on `metadata` (the NSAIndexerMetadata, fresh per forward -> no cross-request staleness)
+            # keyed by the page-table identity for safety. seq_len_sum/max use the GLOBAL per-seq CPU
+            # lengths as gather UPPER BOUNDS (no .item() sync); the gather packs by LOCAL lengths and
+            # ks/ke are local so trailing rows are never indexed.
+            _ck = getattr(forward_batch, "_dcp_ragged_meta", None)
+            if _ck is None or _ck[0] is not block_tables:
+                from sglang.srt.layers.attention.nsa.cp_nsa import (
+                    dcp_local_index_ragged_meta,
+                )
 
-        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
-        seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
-        max_seq_len = torch.max(indexer_seq_lens_cpu).item()
-        k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+                (_lblk, _lidev, _lpt1, _lks, _lke, _lse) = dcp_local_index_ragged_meta(
+                    block_tables,
+                    metadata.get_indexer_seq_len(),
+                    metadata.get_seqlens_expanded(),
+                    metadata.get_token_to_batch_idx(),
+                    _pool_r._dcp_rank, _pool_r._dcp_size, page_size,
+                )
+                _g_cpu = metadata.get_indexer_seq_len_cpu()
+                _ssum = int(_g_cpu.sum())
+                _smax = int(_g_cpu.max()) if _g_cpu.numel() else 0
+                _ck = (block_tables, _lblk, _lidev, _lpt1, _lks, _lke, _lse, _ssum, _smax)
+                forward_batch._dcp_ragged_meta = _ck
+            (block_tables, indexer_seq_len_dev, local_pt1_override,
+             ks, ke, seqlens_expanded_r, seq_len_sum, max_seq_len) = (
+                _ck[1], _ck[2], _ck[3], _ck[4], _ck[5], _ck[6], _ck[7], _ck[8])
+        else:
+            ks, ke = metadata.get_indexer_kvcache_range()
+            indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+            seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
+            max_seq_len = torch.max(indexer_seq_lens_cpu).item()
+            indexer_seq_len_dev = metadata.get_indexer_seq_len()
+        k_fp8, k_scale = _pool_r.get_index_k_scale_buffer(
             layer_id,
-            metadata.get_indexer_seq_len(),
+            indexer_seq_len_dev,
             block_tables,
             seq_len_sum,
             max_seq_len,
@@ -725,7 +786,9 @@ class Indexer(MultiPlatformOp):
         kv_fp8 = (k_fp8, k_scale)
 
         # Check if we need to chunk to avoid OOM
-        seq_lens_expanded = metadata.get_seqlens_expanded()
+        seq_lens_expanded = (
+            seqlens_expanded_r if _shard_r else metadata.get_seqlens_expanded()
+        )
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
@@ -740,7 +803,13 @@ class Indexer(MultiPlatformOp):
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
-            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+            raw_topk_result = metadata.topk_transform(
+                logits,
+                self.index_topk,
+                ks=ks,
+                ke_offset=(seqlens_expanded_r if _shard_r else None),
+                page_table_1_override=local_pt1_override,
+            )
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 
@@ -799,6 +868,7 @@ class Indexer(MultiPlatformOp):
                 ke_offset=lengths_chunk,
                 batch_idx_list=batch_idx_chunk,
                 topk_indices_offset_override=topk_offset_chunk,
+                page_table_1_override=local_pt1_override,
             )
             topk_result[start:end] = raw_topk_chunk
             start = end
@@ -1094,25 +1164,30 @@ class Indexer(MultiPlatformOp):
         Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
         """
 
+        # DCP Stage 2: remap the GLOBAL out_cache_loc -> rank-LOCAL index_k slots (page-ownership)
+        # ONCE here, covering BOTH the fused and fallback stores. No-op unless index sharding is on.
+        # IMPORTANT: do NOT mutate forward_batch.out_cache_loc (the latent set_mla_kv_buffer reads it
+        # and applies its own remap); build a private remapped copy instead.
+        pool = forward_batch.token_to_kv_pool
+        idx_loc = pool.dcp_remap_index_loc(forward_batch.out_cache_loc)
+
         # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
             and can_use_nsa_fused_store(
                 key.dtype,
-                forward_batch.out_cache_loc.dtype,
-                forward_batch.token_to_kv_pool.page_size,
+                idx_loc.dtype,
+                pool.page_size,
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
+            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             fused_store_index_k_cache(
                 key,
                 buf,
-                forward_batch.out_cache_loc,
-                forward_batch.token_to_kv_pool.page_size,
+                idx_loc.contiguous() if not idx_loc.is_contiguous() else idx_loc,
+                pool.page_size,
             )
             return
 
@@ -1120,11 +1195,11 @@ class Indexer(MultiPlatformOp):
         assert act_quant is not None
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
-        out_loc = forward_batch.out_cache_loc
+        out_loc = idx_loc
         if not out_loc.is_contiguous():
             out_loc = out_loc.contiguous()
 
-        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+        pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=out_loc,
             index_k=k_fp8,

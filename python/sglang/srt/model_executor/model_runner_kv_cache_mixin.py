@@ -103,14 +103,23 @@ class ModelRunnerKVCacheMixin:
             from sglang.srt.layers.dp_attention import (
                 get_attention_tp_size as _datps,
             )
-            if (
+            _dcp_on = (
                 _os_dcpm.environ.get("SGLANG_NSA_DECODE_DCP", "0")
                 not in ("0", "", "false", "False")
                 and _os_dcpm.environ.get("SGLANG_NSA_DCP_SHARD_POOL", "1")
                 not in ("0", "", "false", "False")
                 and _datps() > 1
-            ):
-                cell_size = cell_size // _datps()  # latent only; indexer added next (replicated)
+            )
+            if _dcp_on:
+                cell_size = cell_size // _datps()  # latent /dcp
+            # DCP Stage 2: the indexer index_k pool is also sharded /dcp by page when
+            # SGLANG_NSA_DCP_SHARD_INDEX is on -> divide the indexer cell too. MUST match
+            # NSATokenToKVPool.__init__'s index_buf_size //= dcp, else the pool sizer and the
+            # actual buffer disagree. This is what grows max_total toward ~4x/809k.
+            _shard_index = _dcp_on and (
+                _os_dcpm.environ.get("SGLANG_NSA_DCP_SHARD_INDEX", "0")
+                not in ("0", "", "false", "False")
+            )
 
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
             if is_deepseek_nsa(self.model_config.hf_config):
@@ -122,7 +131,10 @@ class ModelRunnerKVCacheMixin:
                 element_size = torch._utils._element_size(
                     NSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                indexer_cell = indexer_size_per_token * num_layers * element_size
+                if _shard_index:
+                    indexer_cell = indexer_cell // _datps()
+                cell_size += indexer_cell
         else:
             if self.model_config.is_hybrid_swa:
                 full_layers_num = len(self.model_config.full_attention_layer_ids)

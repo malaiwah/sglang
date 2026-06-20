@@ -238,3 +238,129 @@ def page_owned_local_selection(page_table_1, nsa_seqlens, dcp_rank, dcp_size, pa
     out = torch.gather(local_owned, 1, order).contiguous()
     counts = owned.sum(dim=1).to(torch.int32)
     return out, counts
+
+
+def dcp_local_index_paged_tables(real_page_table, seqlens, dcp_rank, dcp_size, page_size):
+    """DCP Stage-2 (indexer sharded): build this rank's RANK-LOCAL page tables + seq lens for the
+    PAGED (decode) indexer read over its /dcp-sized index_k shard.
+
+    real_page_table : [B, P] int32 — GLOBAL physical page ids per sequence (page_table_64).
+    seqlens         : [B] int  — GLOBAL token count per sequence (cache_seqlens).
+    Ownership by PHYSICAL page: owner(g) = g % dcp_size; local page id = g // dcp_size (matches the
+    index_k set-path remap dcp_remap_index_loc and the latent pool). The rank scores ONLY its owned
+    pages, so the indexer cost + logits memory both drop ~/dcp (THE Stage-2 prefill/decode win).
+
+    Returns:
+      local_real_pt   [B, Pl] int32  — owned local page ids compacted to the front, 0-padded.
+      local_seqlens   [B] int32      — owned TOKEN count per sequence (drives the logits kernel).
+      local_pt1       [B, Pl*page_size] int32 — token-level LOCAL slot table for topk_transform
+                       (entry c maps logits column c -> local KV slot). Pl = ceil(P/dcp)+1 (static).
+
+    Pure tensor ops (no host sync / .item()) -> cuda-graph-safe. Pl is static (P, dcp fixed) so the
+    decode graph captures cleanly.
+    """
+    dev = real_page_table.device
+    B, P = real_page_table.shape
+    rpt = real_page_table.to(torch.int64)
+    sl = seqlens.to(torch.int64).reshape(B, 1)
+    ar = torch.arange(P, device=dev).reshape(1, P)
+    num_pages = (sl + page_size - 1) // page_size            # [B,1] ceil(seqlen/page)
+    valid = ar < num_pages                                   # [B,P] logical page in-range
+    owned = valid & ((rpt % dcp_size) == dcp_rank)           # [B,P]
+    # tokens contributed by each LOGICAL page (last in-range page is partial)
+    is_last = ar == (num_pages - 1)
+    last_tokens = sl - (num_pages - 1) * page_size           # [B,1] tokens in the partial last page
+    tokens_in_page = torch.where(
+        is_last, last_tokens.expand(B, P),
+        torch.full((1, 1), page_size, device=dev, dtype=torch.int64).expand(B, P),
+    )
+    tokens_in_page = torch.where(valid, tokens_in_page, torch.zeros((), device=dev, dtype=torch.int64))
+    local_seqlens = (owned.to(torch.int64) * tokens_in_page).sum(dim=1).to(torch.int32)  # [B]
+    # owned local page id (non-owned -> -1 sentinel); compact owned to the front via stable argsort.
+    # PEER-REVIEW S5: use -1 (not 0) for non-owned so a stray non-owned column never silently reads
+    # scratch slot 0 as a real token; only the first local_seqlens columns are ever selected anyway.
+    local_pages = torch.where(owned, rpt // dcp_size, torch.full((), -1, device=dev, dtype=torch.int64))
+    order = torch.argsort((~owned).to(torch.int8), dim=1, stable=True)
+    local_real_pt_full = torch.gather(local_pages, 1, order)  # [B,P] owned-first, -1-padded
+    # PEER-REVIEW S1 (CRITICAL): ownership is by PHYSICAL page (real_page_table % dcp), and physical
+    # page ids in one sequence are allocator-scattered, so a rank can own up to ALL P logical pages
+    # (NOT ~P/dcp). A static Pl=ceil(P/dcp)+1 would silently DROP owned pages -> wrong top-k. The only
+    # safe static (cuda-graph) bound is Pl=P. The capacity win is in the /dcp-sized index_k BUFFER, not
+    # this per-call page table; keeping Pl=P costs only a transient table, not pool memory.
+    Pl = P
+    local_real_pt = local_real_pt_full.contiguous().to(torch.int32)
+    # expand page-level -> token-level LOCAL slots: slot(c) = local_page(c//ps)*ps + c%ps.
+    # non-owned (local_page=-1) -> negative slot (never selected; defense-in-depth with S5).
+    cols = torch.arange(Pl * page_size, device=dev).reshape(1, Pl * page_size)
+    pidx = cols // page_size                                  # [1, Pl*ps]
+    off = cols % page_size
+    lp = torch.gather(local_real_pt.to(torch.int64), 1, pidx.expand(B, -1))  # [B, Pl*ps]
+    local_pt1 = torch.where(
+        lp >= 0, lp * page_size + off, torch.full((), -1, device=dev, dtype=torch.int64)
+    ).to(torch.int32).contiguous()
+    return local_real_pt, local_seqlens, local_pt1
+
+
+def dcp_local_index_ragged_meta(real_page_table, seq_lens, seqlens_expanded,
+                                token_to_batch_idx, dcp_rank, dcp_size, page_size):
+    """DCP Stage-2 RAGGED (prefill/extend) rank-local indexer metadata over the /dcp index_k shard.
+
+    Like dcp_local_index_paged_tables but ALSO computes per-query rank-local ks/ke + effective lengths
+    for the ragged MQA logits + topk (PAGED transform with row_starts). The HARD part: ownership is by
+    PHYSICAL page (real_page_table % dcp), so the count of owned tokens in a query's CAUSAL prefix is
+    data-dependent (depends on which scattered physical pages the sequence got) -> a cumsum over the
+    owned mask, gathered at the query's causal page. Prefill is EAGER (not cuda-graph) so per-forward
+    host compute / .item() is fine.
+
+    real_page_table  : [B, P] int32 GLOBAL physical page ids per sequence (page_table_64).
+    seq_lens         : [B] global per-sequence KV length.
+    seqlens_expanded : [Q] global per-QUERY-token causal KV length (get_seqlens_expanded()).
+    token_to_batch_idx: [Q] per-query batch index.
+    Returns: local_real_pt [B,P], local_indexer_seq_lens [B], local_pt1 [B,P*ps],
+             local_ks [Q], local_ke [Q], local_seqlens_expanded [Q] (all rank-local).
+    """
+    dev = real_page_table.device
+    B, P = real_page_table.shape
+    ps = page_size
+    rpt = real_page_table.to(torch.int64)
+    sl = seq_lens.to(torch.int64).reshape(B, 1)
+    ar = torch.arange(P, device=dev).reshape(1, P)
+    num_pages = (sl + ps - 1) // ps
+    valid = ar < num_pages
+    owned = valid & ((rpt % dcp_size) == dcp_rank)            # [B,P] logical-page order
+    is_last = ar == (num_pages - 1)
+    last_tokens = sl - (num_pages - 1) * ps
+    tip = torch.where(is_last, last_tokens.expand(B, P),
+                      torch.full((1, 1), ps, device=dev, dtype=torch.int64).expand(B, P))
+    tip = torch.where(valid, tip, torch.zeros((), device=dev, dtype=torch.int64))
+    local_indexer_seq_lens = (owned.to(torch.int64) * tip).sum(dim=1).to(torch.int32)   # [B]
+    # compacted local page table + token-level slot table (Pl=P, see S1 fix)
+    local_pages = torch.where(owned, rpt // dcp_size, torch.full((), -1, device=dev, dtype=torch.int64))
+    order = torch.argsort((~owned).to(torch.int8), dim=1, stable=True)
+    local_real_pt = torch.gather(local_pages, 1, order).contiguous().to(torch.int32)    # [B,P]
+    cols = torch.arange(P * ps, device=dev).reshape(1, P * ps)
+    pidx = cols // ps
+    off = cols % ps
+    lp = torch.gather(local_real_pt.to(torch.int64), 1, pidx.expand(B, -1))
+    local_pt1 = torch.where(lp >= 0, lp * ps + off,
+                            torch.full((), -1, device=dev, dtype=torch.int64)).to(torch.int32).contiguous()
+    # per-query causal owned-token count: owned full pages before the causal last page (each ps tokens)
+    # + (partial last page tokens if that page is owned). Uses cumsum of owned*ps over logical pages.
+    owned_cumsum = torch.cumsum(owned.to(torch.int64) * ps, dim=1)                       # [B,P] inclusive
+    Lq = seqlens_expanded.to(torch.int64)                                                # [Q]
+    qb = token_to_batch_idx.to(torch.int64)                                              # [Q]
+    last_pg = torch.clamp((Lq - 1) // ps, min=0)                                         # [Q] causal last logical page
+    rem_q = Lq - last_pg * ps                                                            # [Q] tokens in causal last page
+    prev_idx = torch.clamp(last_pg - 1, min=0)
+    owned_before = torch.where(last_pg > 0, owned_cumsum[qb, prev_idx],
+                               torch.zeros((), device=dev, dtype=torch.int64))           # [Q]
+    owned_last_pg = owned[qb, last_pg]                                                    # [Q] bool
+    owned_last = torch.where(owned_last_pg, rem_q, torch.zeros((), device=dev, dtype=torch.int64))
+    local_seqlens_expanded = (owned_before + owned_last).to(torch.int32)                  # [Q]
+    # ks/ke into the packed LOCAL K (cumsum of local per-seq lengths)
+    local_cu = torch.zeros(B + 1, device=dev, dtype=torch.int64)
+    local_cu[1:] = torch.cumsum(local_indexer_seq_lens.to(torch.int64), dim=0)
+    local_ks = local_cu[qb].to(torch.int32)                                              # [Q]
+    local_ke = (local_cu[qb] + local_seqlens_expanded.to(torch.int64)).to(torch.int32)   # [Q]
+    return (local_real_pt, local_indexer_seq_lens, local_pt1,
+            local_ks, local_ke, local_seqlens_expanded)
