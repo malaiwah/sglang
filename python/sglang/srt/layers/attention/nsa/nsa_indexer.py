@@ -450,7 +450,26 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-        if _is_cuda:
+        if _is_cuda and schedule_metadata is None:
+            # b12x metadata builder (sm120-native) — deep_gemm's asserts on sm120.
+            if __import__("os").environ.get("SGLANG_NSA_B12X_LOGITS", "1") == "1":
+                try:
+                    from b12x.integration.indexer import (
+                        build_paged_mqa_schedule_metadata as _b12x_build_meta,
+                    )
+
+                    schedule_metadata = _b12x_build_meta(
+                        seqlens_32, blocksize, self.sm_count
+                    )
+                except Exception as _e:  # noqa
+                    import logging as _l
+
+                    _l.getLogger("glm_b12x_indexer").warning(
+                        "GLM-B12X build_paged_mqa_schedule_metadata failed (%r); "
+                        "falling back to deep_gemm",
+                        _e,
+                    )
+                    schedule_metadata = None
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, blocksize, self.sm_count
@@ -501,16 +520,66 @@ class Indexer(MultiPlatformOp):
                 WavePerEU=5,
             )
         else:
-            logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8[:q_offset],
-                kv_cache_fp8,
-                weights[:q_offset],
-                seqlens_32,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                clean_logits=False,
-            )
+            # GLM-DSA on sm120: DeepGEMM's fp8_paged_mqa_logits asserts
+            # "Unsupported architecture". b12x has a native sm120 indexer; route to
+            # it. Falls back to deep_gemm (and logs why) if the b12x call mismatches.
+            _b12x_logits = None
+            if __import__("os").environ.get("SGLANG_NSA_B12X_LOGITS", "1") == "1":
+                try:
+                    from b12x.integration.indexer import (
+                        build_paged_mqa_schedule_metadata as _b12x_build_meta,
+                        paged_decode_logits as _b12x_paged_decode_logits,
+                    )
+                    from b12x.attention.indexer.api import (
+                        IndexerPagedDecodeMetadata as _B12XPagedMeta,
+                    )
+
+                    _sched = schedule_metadata
+                    if _sched is None:
+                        _sched = _b12x_build_meta(seqlens_32, block_kv, self.sm_count)
+                    # b12x wants q_fp8 rank-3 (q_rows, heads, head_dim); SGLang
+                    # unsqueeze(1)'d a next_n=1 dim in for deep_gemm — squeeze it out.
+                    _q_b12x = q_fp8[:q_offset]
+                    if _q_b12x.ndim == 4 and _q_b12x.shape[1] == 1:
+                        _q_b12x = _q_b12x.squeeze(1)
+                    # b12x wants index_k_cache rank-2 (num_pages, page*(head+scale));
+                    # SGLang view()'d it to 4D (n,64,1,132) for deep_gemm — flatten.
+                    _ikc_b12x = kv_cache_fp8
+                    if _ikc_b12x.ndim != 2:
+                        _ikc_b12x = _ikc_b12x.reshape(_ikc_b12x.shape[0], -1)
+                    _b12x_logits = _b12x_paged_decode_logits(
+                        q_fp8=_q_b12x,
+                        weights=weights[:q_offset],
+                        index_k_cache=_ikc_b12x,
+                        metadata=_B12XPagedMeta(
+                            real_page_table=block_tables,
+                            cache_seqlens_int32=seqlens_32,
+                            paged_mqa_schedule_metadata=_sched,
+                        ),
+                        page_size=page_size,
+                    )
+                except Exception as _e:  # noqa
+                    import logging as _l
+
+                    _l.getLogger("glm_b12x_indexer").warning(
+                        "GLM-B12X indexer: paged_decode_logits failed (%r); "
+                        "falling back to deep_gemm",
+                        _e,
+                    )
+                    _b12x_logits = None
+            if _b12x_logits is not None:
+                logits = _b12x_logits
+            else:
+                logits = deep_gemm.fp8_paged_mqa_logits(
+                    q_fp8[:q_offset],
+                    kv_cache_fp8,
+                    weights[:q_offset],
+                    seqlens_32,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=False,
+                )
 
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
@@ -544,6 +613,49 @@ class Indexer(MultiPlatformOp):
         # Logits should not exceed 50% of free memory or 30% of total memory
         need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
         return need_chunk, free_mem
+
+    def _ragged_mqa_logits(self, q_fp8_slice, kv_fp8, weights_slice, ks_slice, ke_slice):
+        """Ragged/prefill indexer MQA logits.
+
+        GLM-OPTIONB (2026-06-19): the original DSA port wired only the PAGED/decode
+        indexer to b12x; this RAGGED/prefill path still called deep_gemm.fp8_mqa_logits,
+        which asserts "Unsupported architecture" on sm120 -> any prompt longer than
+        index_topk (2048) crashed. b12x has the sm120-native equivalent
+        (b12x.attention.indexer.extend_logits + IndexerExtendMetadata). Route to it
+        (gated by SGLANG_NSA_B12X_LOGITS, default on), fall back to deep_gemm/aiter.
+        """
+        if not _is_hip and __import__("os").environ.get("SGLANG_NSA_B12X_LOGITS", "1") == "1":
+            try:
+                from b12x.attention.indexer.api import (
+                    extend_logits as _b12x_extend_logits,
+                    IndexerExtendMetadata as _B12XExtendMeta,
+                )
+
+                _q = q_fp8_slice
+                if _q.ndim == 4 and _q.shape[1] == 1:
+                    _q = _q.squeeze(1)
+                return _b12x_extend_logits(
+                    q_fp8=_q,
+                    weights=weights_slice,
+                    kv_fp8=kv_fp8,
+                    metadata=_B12XExtendMeta(k_start=ks_slice, k_end=ke_slice),
+                )
+            except Exception as _e:  # noqa
+                import logging as _l
+
+                _l.getLogger("glm_b12x_indexer").warning(
+                    "GLM-B12X extend_logits failed (%r); falling back to deep_gemm", _e
+                )
+        if _is_hip:
+            from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+            _kv, _scale = kv_fp8
+            return fp8_mqa_logits(
+                q_fp8_slice, _kv, _scale, weights_slice, ks_slice, ke_slice
+            )
+        return deep_gemm.fp8_mqa_logits(
+            q_fp8_slice, kv_fp8, weights_slice, ks_slice, ke_slice, clean_logits=False
+        )
 
     def _get_topk_ragged(
         self,
@@ -622,22 +734,9 @@ class Indexer(MultiPlatformOp):
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
-                if _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
-                    kv, scale = kv_fp8
-                    logits = fp8_mqa_logits(
-                        q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
-                    )
-                else:
-                    logits = deep_gemm.fp8_mqa_logits(
-                        q_fp8[:q_offset],
-                        kv_fp8,
-                        weights[:q_offset],
-                        ks,
-                        ke,
-                        clean_logits=False,
-                    )
+                logits = self._ragged_mqa_logits(
+                    q_fp8[:q_offset], kv_fp8, weights[:q_offset], ks, ke
+                )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
@@ -667,27 +766,13 @@ class Indexer(MultiPlatformOp):
             end = min(start + max_rows, q_offset)
 
             with self._with_real_sm_count():
-                if _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
-                    kv, scale = kv_fp8
-                    logits_chunk = fp8_mqa_logits(
-                        q_fp8[start:end],
-                        kv,
-                        scale,
-                        weights[start:end],
-                        ks[start:end],
-                        ke[start:end],
-                    )
-                else:
-                    logits_chunk = deep_gemm.fp8_mqa_logits(
-                        q_fp8[start:end],
-                        kv_fp8,
-                        weights[start:end],
-                        ks[start:end],
-                        ke[start:end],
-                        clean_logits=False,
-                    )
+                logits_chunk = self._ragged_mqa_logits(
+                    q_fp8[start:end],
+                    kv_fp8,
+                    weights[start:end],
+                    ks[start:end],
+                    ke[start:end],
+                )
 
             lengths_chunk = seq_lens_expanded[start:end]
 

@@ -438,36 +438,51 @@ class NativeSparseAttnBackend(
         batch: int,
         v_head_dim: int,
     ):
-        from b12x.integration.mla import MLAWorkspace
+        # b12x 0.20.0 removed MLAWorkspace.for_fixed_capacity; the new lifecycle is
+        # caps -> plan_sparse_mla_scratch -> allocate a scratch buffer -> plan.bind().
+        # We cache a {plan, buf} holder per mode, grown to the largest capacity seen.
+        from b12x.integration.sparse_mla_scratch import (
+            B12XSparseMLAScratchCaps,
+            plan_sparse_mla_scratch,
+        )
 
         workspace_mode = "verify" if mode == "target_verify" else mode
-        workspace = self.b12x_workspaces.get(workspace_mode)
+        holder = self.b12x_workspaces.get(workspace_mode)
         if (
-            workspace is not None
-            and workspace.max_total_q >= total_q
-            and workspace.max_batch >= batch
+            holder is not None
+            and holder["max_total_q"] >= total_q
+            and holder["max_batch"] >= batch
         ):
-            return workspace
+            return holder
 
-        if workspace is not None:
-            total_q = max(total_q, workspace.max_total_q)
-            batch = max(batch, workspace.max_batch)
+        if holder is not None:
+            total_q = max(total_q, holder["max_total_q"])
+            batch = max(batch, holder["max_batch"])
 
-        workspace = MLAWorkspace.for_fixed_capacity(
-            mode=workspace_mode,
+        caps = B12XSparseMLAScratchCaps(
             device=self.device,
+            num_q_heads=self.num_q_heads,
+            max_q_rows=max(total_q, 1),
+            max_width=self.nsa_index_topk,
             dtype=self.q_dtype,
             kv_dtype=self.kv_cache_dtype,
-            num_q_heads=self.num_q_heads,
             head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
             v_head_dim=v_head_dim,
-            topk=self.nsa_index_topk,
-            max_total_q=max(total_q, 1),
+            mode=workspace_mode,
             max_batch=max(batch, 1),
             page_size=self.real_page_size,
         )
-        self.b12x_workspaces[workspace_mode] = workspace
-        return workspace
+        plan = plan_sparse_mla_scratch(caps)
+        _shape, _dt = plan.shapes_and_dtypes()[0]
+        _buf = torch.empty(_shape, dtype=_dt, device=self.device)
+        holder = {
+            "plan": plan,
+            "buf": _buf,
+            "max_total_q": max(total_q, 1),
+            "max_batch": max(batch, 1),
+        }
+        self.b12x_workspaces[workspace_mode] = holder
+        return holder
 
     def _forward_b12x(
         self,
@@ -494,39 +509,205 @@ class NativeSparseAttnBackend(
             v_head_dim=v_head_dim,
         )
         if mode == "decode":
-            b12x_metadata = MLASparseDecodeMetadata(
-                page_table_1=page_table_1,
+            # GLM-OPTIONB DEBUG (2026-06-19): one-shot dump of real decode inputs.
+            import os as _os
+            cs = metadata.cache_seqlens_int32
+            if (
+                _os.environ.get("SGLANG_NSA_DEBUG_DUMP")
+                and getattr(type(self), "_dbg_decode_dumped", 0) < 4
+                and not torch.cuda.is_current_stream_capturing()
+                and int(cs.max()) > 2
+            ):
+                try:
+                    pt = page_table_1
+                    nsa = metadata.nsa_cache_seqlens_int32
+                    with open("/root/.cache/huggingface/nsa_dump.txt", "a") as _f:
+                        _f.write(
+                            f"[decode] q_all {tuple(q_all.shape)} {q_all.dtype} "
+                            f"norm={q_all.float().norm().item():.3f} "
+                            f"nan={bool(q_all.isnan().any())}\n"
+                            f"  kv_cache {tuple(kv_cache.shape)} {kv_cache.dtype}\n"
+                            f"  page_table_1(selected) {tuple(pt.shape)} {pt.dtype} "
+                            f"min={int(pt.min())} max={int(pt.max())} "
+                            f"row0[:20]={pt[0][:20].tolist()}\n"
+                            f"  cache_seqlens {cs.tolist()[:8]} "
+                            f"nsa_cache_seqlens {nsa.tolist()[:8]}\n"
+                        )
+                    type(self)._dbg_decode_dumped = (
+                        getattr(type(self), "_dbg_decode_dumped", 0) + 1
+                    )
+                except Exception as _e:
+                    pass
+            # --- decode context-parallel (DCP) -------------------------------------
+            # When --attn-cp-size>1 (attn_tp=1 layout), shard the selected (top-k)
+            # tokens across the attn-cp ranks, partial-decode each shard with
+            # return_lse, and LSE-merge the per-rank partials into the exact global
+            # output. Active only when cp_size>1; byte-identical to the legacy path
+            # otherwise. SGLANG_NSA_DECODE_CP=0 forces the full per-rank decode (for
+            # A/B isolation of the merge at the same attn_tp=1 layout).
+            import os as _os_cp
+            try:
+                from sglang.srt.layers.dp_attention import (
+                    get_attention_cp_size as _gcs,
+                )
+
+                _cp_size = _gcs()
+            except Exception:
+                _cp_size = 1
+            if _cp_size > 1 and _os_cp.environ.get(
+                "SGLANG_NSA_DECODE_CP", "1"
+            ) not in ("0", "", "false", "False"):
+                return self._decode_cp(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    metadata=metadata,
+                    sm_scale=sm_scale,
+                    v_head_dim=v_head_dim,
+                    workspace=workspace,
+                    cp_size=_cp_size,
+                )
+            # b12x 0.20.0: flattened API — bind tensors to the scratch plan, then
+            # pass the binding (no MLASparseDecodeMetadata / workspace= anymore).
+            binding = workspace["plan"].bind(
+                scratch=workspace["buf"],
+                q=q_all,
+                selected_indices=page_table_1,
                 cache_seqlens_int32=metadata.cache_seqlens_int32,
                 nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-                max_seq_len_k=metadata.max_seq_len_k,
             )
-            return sparse_mla_decode_forward(
-                q_all=q_all,
+            _o_dec = sparse_mla_decode_forward(
                 kv_cache=kv_cache,
-                metadata=b12x_metadata,
-                workspace=workspace,
+                binding=binding,
                 sm_scale=sm_scale,
                 v_head_dim=v_head_dim,
             )
+            if (
+                _os.environ.get("SGLANG_NSA_DEBUG_SAVE")
+                and not getattr(type(self), "_dbg_saved", 0)
+                and not torch.cuda.is_current_stream_capturing()
+                and int(cs.max()) > 2
+            ):
+                try:
+                    _valid = page_table_1[0][page_table_1[0] >= 0]
+                    torch.save(
+                        {
+                            "q_all": q_all.detach().cpu(),
+                            "kv_rows": kv_cache[_valid.long()].detach().cpu(),
+                            "valid_slots": _valid.detach().cpu(),
+                            "selected": page_table_1.detach().cpu(),
+                            "cache_seqlens": cs.detach().cpu(),
+                            "nsa": metadata.nsa_cache_seqlens_int32.detach().cpu(),
+                            "O": _o_dec.detach().cpu(),
+                            "sm_scale": float(sm_scale),
+                            "v_head_dim": int(v_head_dim),
+                        },
+                        "/root/.cache/huggingface/real_decode.pt",
+                    )
+                    type(self)._dbg_saved = 1
+                except Exception:
+                    pass
+            return _o_dec
 
-        b12x_metadata = MLASparseExtendMetadata(
-            page_table_1=page_table_1,
+        # b12x 0.20.0: extend resolves the binding exactly like decode —
+        # binding.selected_indices is mapped to `selected_token_offsets` inside
+        # sparse_mla_extend_forward (_resolve_sparse_mla_binding, selected_name=
+        # "selected_token_offsets"). So the same plan.bind() as decode applies; the
+        # per-query topk selection lives in page_table_1.
+        binding = workspace["plan"].bind(
+            scratch=workspace["buf"],
+            q=q_all,
+            selected_indices=page_table_1,
             cache_seqlens_int32=metadata.cache_seqlens_int32,
             nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-            nsa_cu_seqlens_q=metadata.nsa_cu_seqlens_q,
-            nsa_cu_seqlens_k=metadata.nsa_cu_seqlens_k,
-            max_seq_len_q=metadata.max_seq_len_q,
-            max_seq_len_k=metadata.max_seq_len_k,
-            mode=mode,
         )
         return sparse_mla_extend_forward(
-            q_all=q_all,
             kv_cache=kv_cache,
-            metadata=b12x_metadata,
-            workspace=workspace,
+            binding=binding,
             sm_scale=sm_scale,
             v_head_dim=v_head_dim,
         )
+
+    def _decode_cp(
+        self,
+        *,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        metadata: NSAMetadata,
+        sm_scale: float,
+        v_head_dim: int,
+        workspace: dict,
+        cp_size: int,
+    ) -> torch.Tensor:
+        """Decode-context-parallel: each attn-cp rank attends to the subset of the
+        selected (top-k) tokens it owns; the per-rank partial (out, lse) are then
+        all-gathered and LSE-merged into the EXACT global sparse-MLA output.
+
+        M1 (capacity-neutral): the KV pool is still replicated, so page_table_1 is
+        identical on every rank and we partition it by COLUMN (rank r owns selected
+        columns r::cp_size — a front-valid prefix per row). M2 will instead shard the
+        KV pool by token ownership, making this the natural per-rank-local selection.
+
+        Validated standalone (b12x_cp_merge_probe.py) and across 4 NCCL ranks
+        (cp_nsa_dist_test.py). The cross-rank merge reuses b12x's standalone
+        run_sparse_mla_split_decode_merge via cp_nsa.merge_cp_decode_output.
+        """
+        import torch.nn.functional as _F
+        from b12x.integration.mla import sparse_mla_decode_forward
+        from sglang.srt.layers.attention.nsa.cp_nsa import merge_cp_decode_output
+        from sglang.srt.layers.dp_attention import (
+            get_attention_cp_group,
+            get_attention_cp_rank,
+        )
+
+        cp_rank = get_attention_cp_rank()
+        pg = getattr(get_attention_cp_group(), "device_group", None)
+        dev = page_table_1.device
+        W = page_table_1.shape[1]
+        nsa = metadata.nsa_cache_seqlens_int32  # [batch] valid selected count per row
+
+        # This rank owns selected columns cp_rank::cp_size. Because orig_col grows
+        # monotonically along the stride, the owned valid entries are a prefix.
+        owned_slice = page_table_1[:, cp_rank::cp_size]  # [batch, Wr]
+        Wr = owned_slice.shape[1]
+        orig_col = cp_rank + torch.arange(Wr, device=dev, dtype=torch.int64) * cp_size
+        owned_nsa = (
+            (orig_col.unsqueeze(0) < nsa.unsqueeze(1).to(torch.int64)).sum(dim=1).to(torch.int32)
+        )
+        # Pad owned columns back to the planned width W (kernel reads owned_nsa from front).
+        owned_pt = (
+            _F.pad(owned_slice, (0, W - Wr), value=-1).contiguous()
+            if Wr < W
+            else owned_slice.contiguous()
+        )
+
+        # Empty-owner rows: feed 1 dummy entry so the kernel stays valid, then mark the
+        # row's lse = -inf so the merge skips this rank's contribution for that row.
+        empty = owned_nsa == 0
+        safe_nsa = torch.where(empty, torch.ones_like(owned_nsa), owned_nsa)
+
+        binding = workspace["plan"].bind(
+            scratch=workspace["buf"],
+            q=q_all,
+            selected_indices=owned_pt,
+            cache_seqlens_int32=metadata.cache_seqlens_int32,
+            nsa_cache_seqlens_int32=safe_nsa,
+        )
+        o_r, lse_r = sparse_mla_decode_forward(
+            kv_cache=kv_cache,
+            binding=binding,
+            sm_scale=sm_scale,
+            v_head_dim=v_head_dim,
+            return_lse=True,
+            lse_scale="base2",
+        )
+        rows = q_all.shape[0]
+        o_r = o_r.reshape(rows, self.num_q_heads, v_head_dim)
+        lse_r = lse_r.reshape(rows, self.num_q_heads).float()
+        if bool(empty.any()):
+            lse_r[empty] = float("-inf")
+        return merge_cp_decode_output(o_r, lse_r, cp_group=pg)
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size
@@ -1538,6 +1719,23 @@ class NativeSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+                import os as _os
+                if (
+                    _os.environ.get("SGLANG_NSA_DEBUG_DUMP")
+                    and getattr(type(self), "_dbg_wr_dumped", 0) < 3
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    try:
+                        with open("/root/.cache/huggingface/nsa_dump.txt", "a") as _f:
+                            _f.write(
+                                f"[extend-write] k(c_kv) {tuple(k.shape)} {k.dtype} "
+                                f"absmean={k.float().abs().mean().item():.5f} "
+                                f"rms={k.float().pow(2).mean().sqrt().item():.5f} | "
+                                f"k_rope absmean={k_rope.float().abs().mean().item():.5f}\n"
+                            )
+                        type(self)._dbg_wr_dumped = getattr(type(self), "_dbg_wr_dumped", 0) + 1
+                    except Exception:
+                        pass
                 forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
                     layer,
                     cache_loc,
@@ -1585,6 +1783,13 @@ class NativeSparseAttnBackend(
             forward_batch.forward_mode
         )
         if nsa_impl == "b12x":
+            # GLM-OPTIONB (2026-06-19): EXTEND/prefill keeps RAW request-local topk_indices.
+            # The b12x prefill kernel (run_unified_prefill_mg) does its own page-table
+            # handling and expects request-local indices — gathering to global slots here
+            # triggers a device-side assert. This is ASYMMETRIC with decode: the b12x
+            # DECODE kernel (run_unified_decode) needs PRE-gathered global slots (validated
+            # by b12x_sparse_mla_probe.py: cos 1.0 global vs 0.08 raw), so only the decode
+            # branch gathers. Do NOT "fix" this to match decode.
             page_table_1 = topk_indices
         elif envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
@@ -1792,6 +1997,35 @@ class NativeSparseAttnBackend(
                 layer.layer_id,
             )
         elif self.nsa_decode_impl == "b12x":
+            import os as _os
+            if (
+                _os.environ.get("SGLANG_NSA_DEBUG_DUMP")
+                and getattr(type(self), "_dbg_pre_dumped", 0) < 4
+                and not torch.cuda.is_current_stream_capturing()
+                and topk_indices is not None
+                and int(metadata.cache_seqlens_int32.max()) > 2
+            ):
+                try:
+                    pt = metadata.page_table_1
+                    ti = topk_indices
+                    with open("/root/.cache/huggingface/nsa_dump.txt", "a") as _f:
+                        _f.write(
+                            f"[pre-transform] topk_indices {tuple(ti.shape)} {ti.dtype} "
+                            f"min={int(ti.min())} max={int(ti.max())} "
+                            f"row0valid={ti[0][ti[0]>=0][:12].tolist()}\n"
+                            f"  metadata.page_table_1 {tuple(pt.shape)} {pt.dtype} "
+                            f"min={int(pt.min())} max={int(pt.max())} row0[:12]={pt[0][:12].tolist()}\n"
+                            f"  cache_seqlens={metadata.cache_seqlens_int32.tolist()[:6]} "
+                            f"nsa={metadata.nsa_cache_seqlens_int32.tolist()[:6]}\n"
+                        )
+                    type(self)._dbg_pre_dumped = getattr(type(self), "_dbg_pre_dumped", 0) + 1
+                except Exception:
+                    pass
+            # GLM-OPTIONB (2026-06-19): with SGLANG_NSA_FUSE_TOPK=True (default) + PAGED
+            # method (forced for b12x), topk_transform already returns a TRANSFORMED
+            # global page table (fast_topk_transform_fused). topk_indices ARE the global
+            # KV-slot ids the MLA decode needs -> pass directly. (transform here would
+            # double-transform -> OOB assert.)
             page_table_1 = topk_indices
         elif envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
