@@ -160,14 +160,11 @@ def owned_local_selection(global_topk_gids, cp_rank, cp_size):
     owned = (global_topk_gids >= 0) & (global_topk_gids % cp_size == cp_rank)
     local = torch.where(owned, global_topk_gids // cp_size,
                         global_topk_gids.new_full((), -1)).to(torch.int32)
-    # compact each row's owned slots to the front, -1 pad the rest (left-packed, order preserved)
-    out = torch.full((rows, topk), -1, device=global_topk_gids.device, dtype=torch.int32)
-    counts = torch.zeros(rows, device=global_topk_gids.device, dtype=torch.int32)
-    for r in range(rows):
-        sl = local[r][owned[r]]
-        n = sl.numel()
-        out[r, :n] = sl
-        counts[r] = n
+    # Vectorized compaction (twin of page_owned_local_selection's fix): a stable argsort by
+    # NOT-owned left-packs each row's owned slots, -1 pads the rest. Order preserved.
+    order = torch.argsort((~owned).to(torch.int8), dim=1, stable=True)
+    out = torch.gather(local, 1, order).contiguous()
+    counts = owned.sum(dim=1).to(torch.int32)
     return out, counts
 
 
