@@ -763,8 +763,7 @@ class NativeSparseAttnBackend(
         rows = q_all.shape[0]
         o_r = o_r.reshape(rows, self.num_q_heads, v_head_dim)
         lse_r = lse_r.reshape(rows, self.num_q_heads).float()
-        if bool(empty.any()):
-            lse_r[empty] = float("-inf")
+        lse_r[empty] = float("-inf")  # unconditional masked write — no host sync (perf #1)
         return merge_cp_decode_output(o_r, lse_r, cp_group=pg)
 
     def _decode_dcp(
@@ -806,14 +805,14 @@ class NativeSparseAttnBackend(
             page_table_1, nsa, rank, dcp, self.real_page_size,
             remap_local=self.dcp_shard_pool,
         )
-        W = page_table_1.shape[1]
-        if owned_pt.shape[1] < W:
-            owned_pt = _F.pad(owned_pt, (0, W - owned_pt.shape[1]), value=-1)
-        owned_pt = owned_pt.contiguous()
+        # owned_pt is already [rows, W] and contiguous (page_owned_local_selection gathers over
+        # the full W columns and returns .contiguous()): the old pad branch was dead and the extra
+        # .contiguous() a redundant rows×W copy/layer. Dropped (perf #4).
         empty = owned_cnt == 0
-        if bool(empty.any()):
-            # empty-owner rows: read dummy slot 0 (valid), discard via lse=-inf after.
-            owned_pt[empty, 0] = 0
+        # Empty-owner rows read dummy slot 0 (valid), discarded via lse=-inf after step 3. The
+        # masked write is a no-op when no row is empty, so do it UNCONDITIONALLY: the old
+        # `if bool(empty.any())` forced a GPU->CPU sync (pipeline stall) every layer (perf #1).
+        owned_pt[empty, 0] = 0
         safe_cnt = torch.where(empty, torch.ones_like(owned_cnt), owned_cnt)
 
         # 3) decode ALL heads over this rank's owned KV shard (all-H scratch), return LSE
@@ -841,8 +840,7 @@ class NativeSparseAttnBackend(
         )
         o_r = o_r.reshape(rows, h_all, v_head_dim)
         lse_r = lse_r.reshape(rows, h_all).float()
-        if bool(empty.any()):
-            lse_r[empty] = float("-inf")
+        lse_r[empty] = float("-inf")  # unconditional masked write — no host sync (perf #1)
 
         # 4) LSE-merge the per-rank all-H partials -> exact global all-H attention
         merged = merge_cp_decode_output(o_r, lse_r, cp_group=pg)  # [rows, h_all, v]
@@ -884,13 +882,11 @@ class NativeSparseAttnBackend(
             page_table_1, nsa, rank, dcp, self.real_page_size,
             remap_local=self.dcp_shard_pool,
         )
-        W = page_table_1.shape[1]
-        if owned_pt.shape[1] < W:
-            owned_pt = _F.pad(owned_pt, (0, W - owned_pt.shape[1]), value=-1)
-        owned_pt = owned_pt.contiguous()
+        # owned_pt already [rows, W] + contiguous (see _decode_dcp): pad branch dead, extra
+        # .contiguous() redundant -> dropped (perf #4).
         empty = owned_cnt == 0
-        if bool(empty.any()):
-            owned_pt[empty, 0] = 0
+        # Unconditional masked write (no-op when no empty row) — no GPU->CPU sync/layer (perf #1).
+        owned_pt[empty, 0] = 0
         safe_cnt = torch.where(empty, torch.ones_like(owned_cnt), owned_cnt)
 
         ws = self._get_b12x_workspace(
@@ -917,8 +913,7 @@ class NativeSparseAttnBackend(
         )
         o_r = o_r.reshape(rows, h_all, v_head_dim)
         lse_r = lse_r.reshape(rows, h_all).float()
-        if bool(empty.any()):
-            lse_r[empty] = float("-inf")
+        lse_r[empty] = float("-inf")  # unconditional masked write — no host sync (perf #1)
         merged = merge_cp_decode_output(o_r, lse_r, cp_group=pg)
         return merged[:, rank * h_local:(rank + 1) * h_local, :].contiguous()
 
