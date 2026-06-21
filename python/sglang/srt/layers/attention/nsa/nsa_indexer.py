@@ -528,7 +528,13 @@ class Indexer(MultiPlatformOp):
         local_pt1_override = None
         _local_real_pt = None
         _pool = forward_batch.token_to_kv_pool
-        if getattr(_pool, "_shard_index", False) and not _is_verify_or_draft:
+        # MTP+DCP Stage-2 coexistence: allow target_verify into the shard-read path. The helpers
+        # (dcp_local_index_paged_tables + two_stage_global_topk_paged) are row-wise, so verify's
+        # expanded per-draft-token rows (page_table repeat_interleave'd per draft token) flow through
+        # verbatim — each row gets its own rank-local owned pages then the global top-k merge. Keep
+        # draft_extend OUT (it uses the Triton ragged fill path, not this b12x paged read).
+        _shard_ok = (not _is_verify_or_draft) or forward_batch.forward_mode.is_target_verify()
+        if getattr(_pool, "_shard_index", False) and _shard_ok:
             from sglang.srt.layers.attention.nsa.cp_nsa import (
                 dcp_local_index_paged_tables,
             )

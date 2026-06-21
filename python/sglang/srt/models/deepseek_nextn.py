@@ -81,7 +81,20 @@ class DeepseekModelNextN(nn.Module):
         else:
             moe_quant_config_override = None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        # NOTE: stock DeepSeek-V3 NextN checkpoints ship BF16 MTP-MoE, so the loader
+        # nulls the modelopt_fp4 quant_config to build unpacked experts. But some
+        # checkpoints (e.g. GLM-5.2-NVFP4-REAP-504B) ship the NextN MoE experts
+        # NVFP4-PACKED exactly like the main model — nulling then builds 6144-wide
+        # unpacked params against a 3072-wide packed checkpoint (RuntimeError 6144 vs
+        # 3072 / IndexError start 1536). Keep the quant_config in that case; the
+        # modelopt_fp4 method honors config.json `ignore` (layers.N.eh_proj/self_attn/
+        # mlp.gate/mlp.shared_experts stay BF16) and NVFP4-loads only the experts.
+        _keep_fp4_nextn = os.environ.get("SGLANG_NEXTN_KEEP_FP4", "0") == "1"
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and not _keep_fp4_nextn
+        ):
             logger.warning(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
             )
