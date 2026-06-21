@@ -843,12 +843,42 @@ class Indexer(MultiPlatformOp):
                 _q = q_fp8_slice
                 if _q.ndim == 4 and _q.shape[1] == 1:
                     _q = _q.squeeze(1)
-                return _b12x_extend_logits(
+                # CHUNK-PADDING FIX: the b12x prefill512 extend kernel writes the
+                # (q_rows, k_total_rows) fp32 logits tile with st.global.v4.f32 (16B) stores at
+                # base q_row*k_total_rows, requiring k_total_rows % 4 == 0. k_total_rows =
+                # kv_fp8[0].shape[0] = the running KV length. chunk=1024 keeps it %4; chunk>=2048's
+                # partial tail leaves it arbitrary -> CUDA misaligned address. Pad the KV token
+                # count up to a multiple of 16 (covers the fp32 v4 store + fp8 K tile), run the
+                # kernel on the padded width, then SLICE logits back to the true K before topk
+                # (padded cols are beyond k_end and discarded -> correctness preserved). Gated;
+                # default ON since it's a pure-safety pad. Lets chunk 2048/4096/8192 run.
+                _kv_t, _scale_t = kv_fp8
+                _k_real = int(_kv_t.shape[0])
+                _do_pad = (
+                    __import__("os").environ.get("SGLANG_NSA_PAD_EXTEND_KWIDTH", "1") == "1"
+                    and (_k_real % 16) != 0
+                )
+                if _do_pad:
+                    _k_pad = ((_k_real + 15) // 16) * 16
+                    _n = _k_pad - _k_real
+                    _kv_p = torch.cat(
+                        [_kv_t, _kv_t.new_zeros((_n,) + tuple(_kv_t.shape[1:]))], dim=0
+                    )
+                    _scale_p = torch.cat(
+                        [_scale_t, _scale_t.new_zeros((_n,) + tuple(_scale_t.shape[1:]))], dim=0
+                    )
+                    _kv_in = (_kv_p, _scale_p)
+                else:
+                    _kv_in = kv_fp8
+                _lg = _b12x_extend_logits(
                     q_fp8=_q,
                     weights=weights_slice,
-                    kv_fp8=kv_fp8,
+                    kv_fp8=_kv_in,
                     metadata=_B12XExtendMeta(k_start=ks_slice, k_end=ke_slice),
                 )
+                if _do_pad and _lg.shape[-1] != _k_real:
+                    _lg = _lg[..., :_k_real]
+                return _lg
             except Exception as _e:  # noqa
                 import logging as _l
 
