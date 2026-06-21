@@ -390,6 +390,24 @@ class NativeSparseAttnBackend(
         self.dcp_a2a_merge = self.dcp_enabled and _os_dcp.environ.get(
             "SGLANG_NSA_DCP_A2A_MERGE", "0"
         ) not in ("0", "", "false", "False")
+        # DCP decode merge via the b12x FUSED kernel (merge_cp_decode_output ->
+        # run_sparse_mla_split_decode_merge): all_gather the partials + ONE fused online-softmax
+        # kernel (vs ~6 torch ops in reduce_scatter). For DECODE (bs=1, tiny tensors) the all_gather
+        # is cheap and the fused kernel cuts per-layer kernel launches -> candidate decode win.
+        # Default OFF (A/B). Prefill keeps reduce_scatter (4x less traffic on big tensors).
+        self.dcp_fused_decode_merge = self.dcp_enabled and _os_dcp.environ.get(
+            "SGLANG_NSA_DCP_FUSED_DECODE", "0"
+        ) not in ("0", "", "false", "False")
+        # DCP merge via the vLLM FUSED correct-attn path (merge_cp_correct_rs): all_gather ONLY
+        # the tiny LSE via single-buffer all_gather_into_tensor + ONE fused Triton kernel
+        # (global-LSE + in-place exp2 rescale) + single-buffer reduce_scatter_tensor. Closes the
+        # decode gap vs vLLM (ours 30 Stage-2 / 36 Stage-1 vs 45): same 3 collectives/layer but
+        # drops the ~8-10 eager torch kernels of reduce_scatter AND the list-collective copies.
+        # Same online-softmax (base-2) result as merge_cp_reduce_scatter; used for BOTH decode and
+        # extend when ON. Default OFF (A/B). Takes precedence over a2a when both are set.
+        self.dcp_correct_merge = self.dcp_enabled and _os_dcp.environ.get(
+            "SGLANG_NSA_DCP_CORRECT_MERGE", "0"
+        ) not in ("0", "", "false", "False")
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -815,6 +833,7 @@ class NativeSparseAttnBackend(
         from b12x.integration.mla import sparse_mla_decode_forward
         from sglang.srt.layers.attention.nsa.cp_nsa import (
             merge_cp_a2a,
+            merge_cp_correct_rs,
             merge_cp_decode_output,
             merge_cp_reduce_scatter,
             page_owned_local_selection,
@@ -884,6 +903,15 @@ class NativeSparseAttnBackend(
         # heads directly, moving cp× less data than the all-gather merge. When the a2a gate is on,
         # use the single all-to-all merge (vLLM dcp_a2a_lse_reduce) — same result, fewer PCIe
         # collectives per layer (the no-NVLink decode win).
+        if self.dcp_correct_merge:
+            # vLLM fused correct-attn: all_gather_into_tensor(LSE) + 1 Triton kernel + reduce_scatter_tensor.
+            return merge_cp_correct_rs(o_r, lse_r, cp_group=pg, rank=rank, h_local=h_local)
+        if self.dcp_fused_decode_merge:
+            # all_gather + b12x fused split-merge kernel -> [rows, h_all, V]; slice this rank's heads.
+            merged = merge_cp_decode_output(
+                o_r, lse_r, cp_group=pg, num_chunks=self._cp_num_chunks
+            )
+            return merged[:, rank * h_local : (rank + 1) * h_local, :].contiguous()
         if self.dcp_a2a_merge:
             return merge_cp_a2a(o_r, lse_r, cp_group=pg, rank=rank, h_local=h_local)
         return merge_cp_reduce_scatter(o_r, lse_r, cp_group=pg, rank=rank, h_local=h_local)
@@ -906,6 +934,7 @@ class NativeSparseAttnBackend(
         from b12x.integration.mla import sparse_mla_extend_forward
         from sglang.srt.layers.attention.nsa.cp_nsa import (
             merge_cp_a2a,
+            merge_cp_correct_rs,
             merge_cp_decode_output,
             merge_cp_reduce_scatter,
             page_owned_local_selection,
@@ -964,7 +993,11 @@ class NativeSparseAttnBackend(
         lse_r[empty] = float("-inf")  # unconditional masked write — no host sync (perf #1)
         # vLLM-style merge: all-gather LSE (tiny) + reduce_scatter the weighted output. THIS is
         # the prefill fix — 1024-row merge traffic drops 4× + no stack/merge-kernel per layer.
+        # correct gate: vLLM fused correct-attn (single-buffer collectives + 1 Triton kernel),
+        # same result, fewer eager kernels/list-copies (Stage-1 prefill candidate too).
         # a2a gate: single all-to-all merge (vLLM dcp_a2a_lse_reduce), same result, fewer collectives.
+        if self.dcp_correct_merge:
+            return merge_cp_correct_rs(o_r, lse_r, cp_group=pg, rank=rank, h_local=h_local)
         if self.dcp_a2a_merge:
             return merge_cp_a2a(o_r, lse_r, cp_group=pg, rank=rank, h_local=h_local)
         return merge_cp_reduce_scatter(o_r, lse_r, cp_group=pg, rank=rank, h_local=h_local)

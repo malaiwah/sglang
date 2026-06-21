@@ -27,6 +27,15 @@ try:
 except Exception:  # pragma: no cover - indexer optional at import time
     _b12x_run_row_topk = None
 
+# Triton is needed only by merge_cp_correct_rs (the vLLM fused correct-attn kernel). Import is
+# lazy-safe: if triton is missing the rest of cp_nsa still loads (the correct-merge gate stays off).
+try:
+    import triton
+    import triton.language as tl
+except Exception:  # pragma: no cover - triton optional at import time
+    triton = None
+    tl = None
+
 _SUPPORTED_TOPK = (512, 1024, 2048)
 
 
@@ -187,6 +196,167 @@ def merge_cp_a2a(out_local, lse_local, *, cp_group, rank, h_local):
     )                                                             # [cp, rows, h_local]
     out_shard = (recv_out * w.unsqueeze(-1)).sum(dim=0)           # [rows, h_local, V] fp32
     return out_shard.to(out_dtype).contiguous()
+
+
+# --------------------------------------------------------------------- fused correct-attn merge
+# Port of vLLM's _correct_attn_cp_out_kernel (vllm/v1/attention/ops/common.py:9-94) — the FUSED
+# Triton kernel that, given the all-gathered per-rank LSEs, (a) computes the global LSE and (b)
+# rescales THIS rank's local output IN-PLACE by exp2(local_lse - global_lse). One kernel replaces
+# the ~8-10 EAGER torch ops (amax/where/exp2/log2/sum + (out*w).to) merge_cp_reduce_scatter runs
+# per attention layer. Adapted to base-2 LSE (our lse_scale="base2" -> exp2/log2, NOT exp/log;
+# vLLM gates this via IS_BASE_E and we hard-set base-2). The all-(-inf)-row NaN guard matches
+# merge_cp_reduce_scatter: a row where every rank's LSE is -inf gets global_lse = -inf -> factor 0
+# (finite, contributes nothing) instead of exp2(-inf-(-inf)) = exp2(NaN) = NaN.
+if triton is not None:
+
+    @triton.jit
+    def _correct_attn_cp_out_base2_kernel(
+        outputs_ptr,      # in/out: [rows, H_all, V] (THIS rank's local output, rescaled in place)
+        lses_ptr,         # in:     [cp, rows, H_all] fp32 all-gathered base-2 LSEs
+        outputs_stride_B,
+        outputs_stride_H,
+        outputs_stride_D,
+        lses_stride_N,    # stride over the cp axis
+        lses_stride_B,
+        lses_stride_H,
+        lse_idx,          # this rank's index along the cp axis (rank_in_group)
+        HEAD_DIM: tl.constexpr,
+        N_ROUNDED: tl.constexpr,   # cp, power-of-2 padded for tl.arange
+    ):
+        batch_idx = tl.program_id(axis=0).to(tl.int64)
+        head_idx = tl.program_id(axis=1).to(tl.int64)
+        d_offsets = tl.arange(0, HEAD_DIM)
+        num_n_offsets = tl.arange(0, N_ROUNDED)
+
+        # --- global base-2 logsumexp over the cp axis for this (row, head) ---
+        lse_offsets = (
+            num_n_offsets * lses_stride_N
+            + batch_idx * lses_stride_B
+            + head_idx * lses_stride_H
+        )
+        # mask the padded cp lanes (N_ROUNDED may exceed cp) to -inf so they never contribute.
+        n_mask = num_n_offsets < N_ROUNDED  # constexpr-true here; kept for parity/safety
+        lse = tl.load(lses_ptr + lse_offsets, mask=n_mask, other=-float("inf"))
+        # treat NaN / +inf as -inf (no contribution), matching the eager isfinite guard.
+        lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
+        lse_max = tl.max(lse, axis=0)
+        lse_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
+        lse -= lse_max
+        lse_exp = tl.exp2(lse)          # BASE-2 (our lse_scale="base2")
+        lse_acc = tl.sum(lse_exp, axis=0)
+        glse = tl.log2(lse_acc) + lse_max   # global base-2 LSE for this (row, head)
+
+        # --- rescale THIS rank's local output by exp2(local_lse - global_lse) ---
+        output_offsets = (
+            batch_idx * outputs_stride_B
+            + head_idx * outputs_stride_H
+            + d_offsets * outputs_stride_D
+        )
+        local_lse_off = (
+            lse_idx * lses_stride_N
+            + batch_idx * lses_stride_B
+            + head_idx * lses_stride_H
+        )
+        local_lse = tl.load(lses_ptr + local_lse_off)
+        diff = local_lse - glse
+        # NaN GUARD: all-(-inf) row -> glse=-inf, local_lse=-inf -> diff=NaN; +inf would also poison.
+        # Force factor 0 (finite) so an empty-owner row contributes nothing instead of NaN.
+        diff = tl.where((diff != diff) | (diff == float("inf")), -float("inf"), diff)
+        factor = tl.exp2(diff)          # BASE-2
+        output = tl.load(outputs_ptr + output_offsets)
+        output = output * factor
+        tl.store(outputs_ptr + output_offsets, output)
+
+
+def merge_cp_correct_rs(out_local, lse_local, *, cp_group, rank, h_local):
+    """vLLM cp_lse_ag_out_rs ported to our stack: SAME signature / SAME result as
+    merge_cp_reduce_scatter, implemented the vLLM way for the latency-bound PCIe box.
+
+    The gap vs vLLM is NOT collective COUNT (both 3/layer) but per-collective + per-kernel
+    OVERHEAD: merge_cp_reduce_scatter runs ~8-10 eager torch kernels/layer (stack/amax/where/
+    exp2/log2/sum + (out*w).to) and LIST-based collectives (all_gather(list) + reduce_scatter(
+    chunks) with extra contiguous copies). This path matches vLLM:
+      1. all_gather ONLY the tiny LSE via dist.all_gather_into_tensor into a preallocated
+         [cp, rows, H_all] fp32 buffer (single-buffer, NO list, NO torch.stack).
+      2. ONE fused Triton kernel (_correct_attn_cp_out_base2_kernel) computes the global LSE
+         AND rescales out_local IN-PLACE by exp2(local_lse - global_lse) — no fp32 output
+         materialization, no per-row weight broadcast, with the same all-(-inf) NaN guard.
+      3. reduce_scatter over the HEAD axis via dist.reduce_scatter_tensor from a single
+         contiguous [cp, rows, h_local, V] buffer into a preallocated [rows, h_local, V] out.
+
+    out_local : [rows, H_all, V] bf16 — this rank's ALL-head partial over its KV shard.
+    lse_local : [rows, H_all] fp32 base-2 LSE (lse_scale="base2"); -inf rows contribute 0.
+    Returns [rows, h_local, V] bf16 (this rank's TP head shard of the exact global attention).
+
+    cuda-graph safety (this runs INSIDE the captured decode graph ~60x/token):
+      * all_gather_into_tensor + reduce_scatter_tensor are single-buffer NCCL collectives and
+        are capturable (same as the list variants, minus the host-side list/copy bookkeeping).
+      * The kernel has a FIXED grid (rows, H_all) and constexpr HEAD_DIM / N_ROUNDED, so no
+        autotune and no per-call recompile under capture (the constexprs are static: rows/H/V
+        are fixed per cuda-graph batch, cp is fixed at init). N_ROUNDED is the next pow2 >= cp
+        computed in Python (host-side, capture-safe — no device sync).
+      * No .item(), no H2D copy, no dynamic shapes. The rescale is in-place on out_local.
+    """
+    import torch.distributed as _dist
+
+    if triton is None:
+        raise RuntimeError(
+            "merge_cp_correct_rs requires triton (the fused correct-attn kernel); "
+            "triton failed to import. Use merge_cp_reduce_scatter / merge_cp_a2a instead."
+        )
+
+    cp = _dist.get_world_size(cp_group)
+    rows, H, V = out_local.shape
+    assert H == h_local * cp, f"merge_cp_correct_rs expects H_all={h_local*cp}, got {H}"
+
+    # out_local must be contiguous so the in-place rescale + reduce_scatter chunking are well-defined.
+    out_local = out_local.contiguous()
+    lse_local = lse_local.contiguous().float()
+
+    # 1) all_gather ONLY the LSE into a SINGLE preallocated [cp, rows, H] fp32 buffer.
+    #    all_gather_into_tensor concatenates each rank's [rows, H] into dim 0 -> [cp*rows, H];
+    #    view as [cp, rows, H] (rank r occupies block r). No list, no torch.stack, no per-rank copy.
+    lses = torch.empty((cp, rows, H), device=out_local.device, dtype=torch.float32)
+    _dist.all_gather_into_tensor(lses.view(cp * rows, H), lse_local, group=cp_group)
+
+    # 2) ONE fused kernel: global LSE + in-place exp2(local_lse - global_lse) rescale of out_local.
+    #    Fixed grid (rows, H), constexpr HEAD_DIM=V, N_ROUNDED=next_pow2(cp). lse_idx = this rank.
+    n_rounded = 1
+    while n_rounded < cp:
+        n_rounded *= 2
+    o_sB, o_sH, o_sD = out_local.stride()
+    l_sN, l_sB, l_sH = lses.stride()
+    grid = (rows, H)
+    _correct_attn_cp_out_base2_kernel[grid](
+        out_local,
+        lses,
+        o_sB,
+        o_sH,
+        o_sD,
+        l_sN,
+        l_sB,
+        l_sH,
+        rank,
+        HEAD_DIM=V,
+        N_ROUNDED=n_rounded,
+    )
+
+    # 3) reduce_scatter over the HEAD axis. vLLM reduce_scatters dim=1 (heads); equivalently we
+    #    lay the weighted output out as [cp, rows, h_local, V] contiguous (chunk n = heads for
+    #    rank n) and reduce_scatter_tensor: dim-0 split, summed across ranks. recv = sum_cp of
+    #    THIS rank's head block. Single-buffer (no per-chunk contiguous copies the list path made).
+    #    out_local is already [rows, H=cp*h_local, V] contiguous, so a view splits the head axis
+    #    into (cp, h_local) then permute cp to the front: [cp, rows, h_local, V].
+    rs_in = (
+        out_local.view(rows, cp, h_local, V)
+        .permute(1, 0, 2, 3)
+        .contiguous()
+    )  # [cp, rows, h_local, V] bf16
+    out_shard = torch.empty((rows, h_local, V), device=out_local.device, dtype=out_local.dtype)
+    _dist.reduce_scatter_tensor(
+        out_shard, rs_in.view(cp * rows, h_local, V), group=cp_group
+    )
+    return out_shard
 
 
 # --------------------------------------------------------------------------- indexer merge
