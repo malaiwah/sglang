@@ -110,7 +110,9 @@ def merge_cp_reduce_scatter(out_local, lse_local, *, cp_group, rank, h_local):
     )                                                    # [rows, H]
     # weight in fp32 for precision, cast back to out dtype (bf16) so reduce_scatter sums in the
     # attention output dtype the caller expects (cuda-graph asserts the out dtype).
-    weighted = (out_local * w.unsqueeze(-1)).to(out_local.dtype)   # [rows, H, V]
+    # cast-free: weight in bf16 (cast w bf16 FIRST) so the [rows,H,V] product stays bf16 — no fp32
+    # materialization of the full output every layer (vLLM/b12x keep V bf16 kernel->wire->kernel).
+    weighted = out_local * w.unsqueeze(-1).to(out_local.dtype)   # [rows, H, V] bf16
     # 3) reduce_scatter over the HEAD axis: out_shard = sum_cp(weighted_cp)[:, my_heads, :].
     chunks = [c.contiguous() for c in weighted.chunk(cp, dim=1)]  # cp × [rows, h_local, V]
     out_shard = torch.empty_like(chunks[rank])
@@ -161,17 +163,16 @@ def merge_cp_a2a(out_local, lse_local, *, cp_group, rank, h_local):
     # together as fp32 (a2a needs one dtype; V*+1 fp32 elems/head — the lse cost is negligible and
     # one collective beats two). Pack per (rank-dest, head) row of width V+1 = [out(V) | lse(1)].
     # out_local[:, n*h_local:(n+1)*h_local, :] are the heads for rank n.
-    send_out = out_local.float().view(rows, cp, h_local, V)        # [rows, cp, h_local, V]
-    send_lse = lse_local.float().view(rows, cp, h_local, 1)        # [rows, cp, h_local, 1]
-    # [cp, rows, h_local, V+1] — leading dim = destination rank (the a2a split axis must be dim 0).
-    send_buf = torch.cat([send_out, send_lse], dim=-1).permute(1, 0, 2, 3).contiguous()
-    recv_buf = torch.empty_like(send_buf)                          # [cp, rows, h_local, V+1]
-    _dist.all_to_all_single(
-        recv_buf.view(-1), send_buf.view(-1), group=cp_group,
-    )
-    # recv_buf[j] = rank j's partial (out||lse) for THIS rank's h_local heads.
-    recv_out = recv_buf[..., :V]                                   # [cp, rows, h_local, V] fp32
-    recv_lse = recv_buf[..., V]                                    # [cp, rows, h_local]   fp32
+    # vLLM dcp_a2a_lse_reduce: a2a the partial output in NATIVE bf16 (do NOT upcast to fp32 — that
+    # DOUBLES the dominant PCIe payload, the exact mistake that tanked prefill) + a2a the tiny lse as
+    # fp32 separately. Two small symmetric collectives, output stays bf16 on the wire.
+    send_out = out_local.view(rows, cp, h_local, V).permute(1, 0, 2, 3).contiguous()  # [cp,rows,h_local,V] bf16
+    recv_out = torch.empty_like(send_out)
+    _dist.all_to_all_single(recv_out.view(-1), send_out.view(-1), group=cp_group)
+    send_lse = lse_local.view(rows, cp, h_local).permute(1, 0, 2).contiguous()        # [cp,rows,h_local] fp32
+    recv_lse = torch.empty_like(send_lse)
+    _dist.all_to_all_single(recv_lse.view(-1), send_lse.view(-1), group=cp_group)
+    # recv_out[j]/recv_lse[j] = rank j's partial for THIS rank's h_local heads.
 
     # --- local online-softmax (base-2) combine over the cp axis --------------------------------
     gmax = recv_lse.amax(dim=0)                                    # [rows, h_local]
