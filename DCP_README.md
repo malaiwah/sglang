@@ -18,6 +18,18 @@ Same trick vLLM uses: shard the MLA latent KV (and the NSA `index_k`) across the
   "increases max context at the expense of single-stream gen speed on PCIe" tradeoff.
 - Coherence preserved: GSM8K clean, needle 100% at conc 1/2/4/8.
 
+## ⚠️ Use `--chunked-prefill-size 1024` (NOT 2048+)
+`--chunked-prefill-size 2048` triggers `CUDA error: misaligned address` in the b12x DSA `extend_logits`
+kernel (the partial tail chunk of a ≥16k prompt leaves the logits K-width not 16-byte-aligned). **1024 is
+safe.** Single-stream tests miss it; any multi-request / long-ctx prefill trips it instantly. (Proper fix =
+pad the kernel's K-width to %4; for now just use 1024.)
+
+## Measured on llm-inference-bench (local-inference-lab/llm-inference-bench), 469B Stage-2, chunk=1024
+- Prefill C=1: 1979 / 2032 / 1962 / 1868 / 1616 tok/s @ 8k/16k/32k/64k/128k.
+- Aggregate decode tok/s, **flat across context**: C1≈33.5, C2≈53, C4≈94 at every ctx 0→128k; C8≈137
+  (estonia shared-prefix). 0 crashes across the full matrix.
+- MTP speed configs (504B+NextN): 83 tok/s non-CP / 70 tok/s +DCP single-stream (1.6–1.85× vLLM 45).
+
 ## Run it (easiest: the prebuilt image)
 The DCP Python files ride on the b12x MoE-alpha-fix base. Prebuilt:
 `docker.io/malaiwah/sglang:glm52-reap-dcp` (this branch's files baked onto `malaiwah/sglang:glm52-reap`).
