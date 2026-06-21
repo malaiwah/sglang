@@ -791,7 +791,10 @@ class NativeSparseAttnBackend(
         """
         import torch.nn.functional as _F
         from b12x.integration.mla import sparse_mla_decode_forward
-        from sglang.srt.layers.attention.nsa.cp_nsa import merge_cp_decode_output
+        from sglang.srt.layers.attention.nsa.cp_nsa import (
+            merge_cp_decode_output,
+            page_owned_local_selection,
+        )
         from sglang.srt.layers.dp_attention import (
             get_attention_cp_group,
             get_attention_cp_rank,
@@ -803,25 +806,43 @@ class NativeSparseAttnBackend(
         W = page_table_1.shape[1]
         nsa = metadata.nsa_cache_seqlens_int32  # [batch] valid selected count per row
 
-        # This rank owns selected columns cp_rank::cp_size. Because orig_col grows
-        # monotonically along the stride, the owned valid entries are a prefix.
-        owned_slice = page_table_1[:, cp_rank::cp_size]  # [batch, Wr]
-        Wr = owned_slice.shape[1]
-        orig_col = cp_rank + torch.arange(Wr, device=dev, dtype=torch.int64) * cp_size
-        owned_nsa = (
-            (orig_col.unsqueeze(0) < nsa.unsqueeze(1).to(torch.int64)).sum(dim=1).to(torch.int32)
-        )
-        # Pad owned columns back to the planned width W (kernel reads owned_nsa from front).
-        owned_pt = (
-            _F.pad(owned_slice, (0, W - Wr), value=-1).contiguous()
-            if Wr < W
-            else owned_slice.contiguous()
-        )
-
-        # Empty-owner rows: feed 1 dummy entry so the kernel stays valid, then mark the
-        # row's lse = -inf so the merge skips this rank's contribution for that row.
-        empty = owned_nsa == 0
-        safe_nsa = torch.where(empty, torch.ones_like(owned_nsa), owned_nsa)
+        import os as _os_cpsp
+        cp_shard_pool = _os_cpsp.environ.get(
+            "SGLANG_NSA_CP_SHARD_POOL", "0"
+        ) not in ("0", "", "false", "False")
+        if cp_shard_pool:
+            # arm-C native-CP latent shard: the latent pool is sharded along the NATIVE CP axis
+            # (the SAME SGLANG_NSA_CP_SHARD_POOL gate drives the memory_pool shard, so the reader
+            # axis == the writer axis). Mirror _decode_dcp on (cp_rank, cp_size): per-PAGE owner
+            # (slot//page_size)%cp_size + global->local slot remap. remap_local=True reads the
+            # CP-axis-sharded LOCAL pool (NOT the replicated column-stride carve below).
+            owned_pt, owned_cnt = page_owned_local_selection(
+                page_table_1, nsa, cp_rank, cp_size, self.real_page_size,
+                remap_local=True,
+            )
+            empty = owned_cnt == 0
+            owned_pt[empty, 0] = 0  # dummy slot 0; lse=-inf masks it post-decode
+            safe_nsa = torch.where(empty, torch.ones_like(owned_cnt), owned_cnt)
+        else:
+            # M1 capacity-neutral column-stride carve on the REPLICATED pool (gate off).
+            # This rank owns selected columns cp_rank::cp_size. Because orig_col grows
+            # monotonically along the stride, the owned valid entries are a prefix.
+            owned_slice = page_table_1[:, cp_rank::cp_size]  # [batch, Wr]
+            Wr = owned_slice.shape[1]
+            orig_col = cp_rank + torch.arange(Wr, device=dev, dtype=torch.int64) * cp_size
+            owned_nsa = (
+                (orig_col.unsqueeze(0) < nsa.unsqueeze(1).to(torch.int64)).sum(dim=1).to(torch.int32)
+            )
+            # Pad owned columns back to the planned width W (kernel reads owned_nsa from front).
+            owned_pt = (
+                _F.pad(owned_slice, (0, W - Wr), value=-1).contiguous()
+                if Wr < W
+                else owned_slice.contiguous()
+            )
+            # Empty-owner rows: feed 1 dummy entry so the kernel stays valid, then mark the
+            # row's lse = -inf so the merge skips this rank's contribution for that row.
+            empty = owned_nsa == 0
+            safe_nsa = torch.where(empty, torch.ones_like(owned_nsa), owned_nsa)
 
         binding = workspace["plan"].bind(
             scratch=workspace["buf"],
@@ -842,7 +863,11 @@ class NativeSparseAttnBackend(
         o_r = o_r.reshape(rows, self.num_q_heads, v_head_dim)
         lse_r = lse_r.reshape(rows, self.num_q_heads).float()
         lse_r[empty] = float("-inf")  # unconditional masked write — no host sync (perf #1)
-        return merge_cp_decode_output(o_r, lse_r, cp_group=pg)
+        # Pass the cuda-graph-safe cached num_chunks ([cp_size], built in init_cuda_graph_state);
+        # omitting it hits the torch.tensor([cp]) fallback = capture-illegal H2D copy.
+        return merge_cp_decode_output(
+            o_r, lse_r, cp_group=pg, num_chunks=getattr(self, "_cp_num_chunks", None)
+        )
 
     def _decode_dcp(
         self,
@@ -1499,6 +1524,20 @@ class NativeSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        # cuda-graph-safe num_chunks for the M1 native-CP (orthogonal attn-CP group) decode
+        # merge: build ONCE on-device here. A per-call torch.tensor([cp]) inside _decode_cp is
+        # a host->device copy that is ILLEGAL during cuda-graph capture. Only set if not already
+        # built by the DCP path (which sets it to [dcp_size]); the two paths are mutually exclusive.
+        if getattr(self, "_cp_num_chunks", None) is None:
+            try:
+                from sglang.srt.layers.dp_attention import get_attention_cp_size as _gcs_cg
+                _cp_cg = _gcs_cg()
+            except Exception:
+                _cp_cg = 1
+            if _cp_cg > 1:
+                self._cp_num_chunks = torch.tensor(
+                    [_cp_cg], device=self.device, dtype=torch.int32
+                )
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device

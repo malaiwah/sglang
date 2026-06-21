@@ -1582,23 +1582,42 @@ class MLATokenToKVPool(KVCache):
         import os as _os_dcpp
         self._dcp_size = 1
         self._dcp_rank = 0
-        if (
-            use_nsa
-            and _os_dcpp.environ.get("SGLANG_NSA_DECODE_DCP", "0")
+        # arm-C: shard the latent pool across the NATIVE CP group instead of the attention-TP
+        # group. Toggled by SGLANG_NSA_CP_SHARD_POOL=1, INDEPENDENT of DECODE_DCP — the
+        # _decode_cp read path requires DECODE_DCP=0, so the old (DECODE_DCP and DCP_SHARD_POOL)
+        # gate could never co-fire with it (peer-review Blocker B). The CP axis is the true
+        # context-parallel sibling dim (attn weights stay replicated across attn_tp), so sharding
+        # the pool /cp gives the capacity win WITHOUT the attn-weight tax. _latent_buf_size,
+        # _latent_scratch_slot, BOTH latent set_mla_kv_buffer remaps, and the index_k Stage-2
+        # path all read self._dcp_size/_dcp_rank, so switching ONLY this assignment switches
+        # every dependent site together (the sizer in model_runner_kv_cache_mixin MUST match).
+        _cp_shard = _os_dcpp.environ.get(
+            "SGLANG_NSA_CP_SHARD_POOL", "0"
+        ) not in ("0", "", "false", "False")
+        _dcp_on = (
+            _os_dcpp.environ.get("SGLANG_NSA_DECODE_DCP", "0")
             not in ("0", "", "false", "False")
             and _os_dcpp.environ.get("SGLANG_NSA_DCP_SHARD_POOL", "1")
             not in ("0", "", "false", "False")
-        ):
+        )
+        if use_nsa and (_dcp_on or _cp_shard):
             try:
-                from sglang.srt.layers.dp_attention import (
-                    get_attention_tp_rank as _dtpr,
-                    get_attention_tp_size as _dtps,
-                )
+                if _cp_shard:
+                    from sglang.srt.layers.dp_attention import (
+                        get_attention_cp_rank as _dtpr,
+                        get_attention_cp_size as _dtps,
+                    )
+                else:
+                    from sglang.srt.layers.dp_attention import (
+                        get_attention_tp_rank as _dtpr,
+                        get_attention_tp_size as _dtps,
+                    )
 
                 self._dcp_size = _dtps()
                 self._dcp_rank = _dtpr()
             except Exception:
                 self._dcp_size = 1
+                self._dcp_rank = 0
         self._latent_buf_size = (
             ((self.size + self._dcp_size - 1) // self._dcp_size)
             if self._dcp_size > 1

@@ -153,6 +153,16 @@ class ModelRunnerKVCacheMixin:
             import os as _os_dcpm
             from sglang.srt.layers.dp_attention import (
                 get_attention_tp_size as _datps,
+                get_attention_cp_size as _dacps,
+            )
+            # arm-C: CP-axis latent shard (independent of DECODE_DCP). The divisor MUST equal
+            # NSATokenToKVPool._dcp_size (= get_attention_cp_size() under CP_SHARD_POOL) or
+            # max_total disagrees with the buffer -> OOM/over-commit (peer-review C3). CP and DCP
+            # are mutually exclusive at runtime (_decode_cp needs DECODE_DCP=0).
+            _cp_shard = (
+                _os_dcpm.environ.get("SGLANG_NSA_CP_SHARD_POOL", "0")
+                not in ("0", "", "false", "False")
+                and _dacps() > 1
             )
             _dcp_on = (
                 _os_dcpm.environ.get("SGLANG_NSA_DECODE_DCP", "0")
@@ -161,7 +171,9 @@ class ModelRunnerKVCacheMixin:
                 not in ("0", "", "false", "False")
                 and _datps() > 1
             )
-            if _dcp_on:
+            if _cp_shard:
+                cell_size = cell_size // _dacps()  # arm-C latent /cp
+            elif _dcp_on:
                 cell_size = cell_size // _datps()  # latent /dcp
             # DCP Stage 2: the indexer index_k pool is also sharded /dcp by page when
             # SGLANG_NSA_DCP_SHARD_INDEX is on -> divide the indexer cell too. MUST match
