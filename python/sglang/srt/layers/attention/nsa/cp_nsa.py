@@ -359,6 +359,116 @@ def merge_cp_correct_rs(out_local, lse_local, *, cp_group, rank, h_local):
     return out_shard
 
 
+def merge_cp_correct_rs_streamed(
+    *,
+    run_head_block,
+    rows,
+    h_all,
+    h_local,
+    V,
+    cp_group,
+    rank,
+    hb,
+    out_dtype,
+    device,
+):
+    """HEAD-BLOCK-STREAMED twin of merge_cp_correct_rs — bounds the all-H prefill transient.
+
+    merge_cp_correct_rs materializes THIS rank's ALL-head partial out_local [rows, h_all, V] AND
+    a second [cp, rows, h_local, V] reduce_scatter copy at once. At chunk>=4096 x long ctx that
+    transient (plus the all-H b12x extend scratch) exceeds VRAM -> OOM in _extend_dcp. This variant
+    NEVER materializes all h_all heads' partial output at once: it streams the b12x extend kernel +
+    the in-place LSE rescale over head-BLOCKS of size `hb` (hb divides h_all), writing each rescaled
+    block DIRECTLY into the SINGLE preallocated [cp, rows, h_local, V] reduce_scatter buffer at the
+    correct head offset, then does ONE reduce_scatter at the end.
+
+    CORRECTNESS (== merge_cp_correct_rs to fp tolerance): in merge_cp_correct_rs the rescale factor
+    for (row, head) is exp2(local_lse[row,head] - global_lse[row,head]); global_lse depends ONLY on
+    the all-gathered LSEs across cp for that SAME (row, head) — heads do NOT couple, and a given head
+    appears in exactly ONE head-block. So per head-block:
+      1) Run the b12x extend kernel for ONLY those hb heads -> out_hb [rows, hb, V], lse_hb [rows, hb]
+         (base-2). all_gather ONLY the tiny lse_hb across cp -> [cp, rows, hb] and compute the block's
+         global base-2 logsumexp glse_blk [rows, hb] — the SAME global-LSE arithmetic the fused kernel
+         (_correct_attn_cp_out_base2_kernel) does for these heads, just restricted to the block (the
+         cp-axis logsumexp for head g is independent of every other head, so the block result equals
+         the all-H result sliced to the block).
+      2) Rescale out_hb IN-PLACE by exp2(lse_hb - glse_blk) with the SAME all-(-inf) NaN guard
+         (weight 0 instead of exp2(-inf-(-inf))=NaN), and copy it into the per-(dest-rank) slot of the
+         reduce_scatter buffer. Global head g maps to dest-rank g // h_local and local head g % h_local
+         — EXACTLY the (rows, cp, h_local, V).permute(1,0,2,3) layout merge_cp_correct_rs builds before
+         its reduce_scatter.
+      3) ONE reduce_scatter_tensor over the cp dim of the [cp, rows, h_local, V] buffer -> this rank's
+         h_local-head shard, summed across cp — the SAME collective + the SAME summands (each rank's
+         exp2(local-global)-weighted partial per head) as merge_cp_correct_rs. We merely filled the
+         buffer block-by-block instead of via one in-place rescale + one permute().contiguous() copy.
+         The streamed result therefore equals the non-streamed merge to fp tolerance: the rescale
+         arithmetic is identical; only WHEN/how-much is materialized differs.
+
+    run_head_block(hb0, hb_len) -> (out_hb, lse_hb): caller-supplied; runs the b12x sparse-MLA extend
+        kernel for global heads [hb0:hb0+hb_len] over this rank's owned KV shard with return_lse +
+        lse_scale="base2", returning out_hb [rows, hb_len, V] (out_dtype) and lse_hb [rows, hb_len]
+        (any dtype; cast to fp32 here). The caller MUST apply the empty-owner lse=-inf masked write to
+        lse_hb (so empty rows contribute 0) — mirroring merge_cp_correct_rs's contract that lse_local
+        already carries -inf on empty-owner rows.
+
+    Returns [rows, h_local, V] (out_dtype) — this rank's TP head shard of the exact global attention.
+    Prefill only (NOT cuda-graph captured); no .item()/H2D-copy constraint here, and none are used.
+    """
+    import torch.distributed as _dist
+
+    cp = _dist.get_world_size(cp_group)
+    assert h_all == h_local * cp, (
+        f"merge_cp_correct_rs_streamed expects h_all={h_local * cp}, got {h_all}"
+    )
+    assert h_all % hb == 0, f"head-block hb={hb} must divide h_all={h_all}"
+
+    # The SINGLE preallocated reduce_scatter buffer: [cp, rows, h_local, V] (rank n's heads in block
+    # n along dim 0), the EXACT layout merge_cp_correct_rs reduce_scatters. We fill it head-block by
+    # head-block — never holding all h_all heads' partial output at once.
+    rs_in = torch.zeros((cp, rows, h_local, V), device=device, dtype=out_dtype)
+
+    # stream the b12x extend kernel + per-block LSE merge + in-place rescale, writing each into rs_in.
+    for hb0 in range(0, h_all, hb):
+        hb_len = min(hb, h_all - hb0)
+        out_hb, lse_hb = run_head_block(hb0, hb_len)         # [rows, hb_len, V], [rows, hb_len]
+        out_hb = out_hb.reshape(rows, hb_len, V)
+        lse_hb = lse_hb.reshape(rows, hb_len).contiguous().float()
+        # all_gather ONLY this block's tiny LSE across cp -> [cp, rows, hb_len], then global base-2
+        # logsumexp over the cp axis (the per-head normalizer; heads/blocks are independent).
+        lses = torch.empty((cp, rows, hb_len), device=device, dtype=torch.float32)
+        _dist.all_gather_into_tensor(lses.view(cp * rows, hb_len), lse_hb, group=cp_group)
+        gmax = lses.amax(dim=0)                              # [rows, hb_len]
+        gmax = torch.where(torch.isfinite(gmax), gmax, gmax.new_zeros(()))
+        glse_blk = gmax + torch.log2(torch.exp2(lses - gmax).sum(dim=0))  # [rows, hb_len]
+        # per-(row,head) softmax weight; NaN guard identical to merge_cp_reduce_scatter / the fused
+        # kernel: all-(-inf) row/head -> glse=-inf -> exp2(local-(-inf))=NaN; force weight 0 (finite).
+        w = torch.where(
+            torch.isfinite(glse_blk),
+            torch.exp2(lse_hb - glse_blk),
+            torch.zeros_like(glse_blk),
+        )                                                    # [rows, hb_len]
+        out_hb = out_hb * w.unsqueeze(-1).to(out_dtype)      # rescaled, [rows, hb_len, V] out_dtype
+        # scatter this block's heads into rs_in at their (dest-rank, local-head) slots. The block
+        # spans global heads [hb0, hb0+hb_len); when the block does not straddle a rank boundary
+        # (always true when hb divides h_local, the default) the whole block lands in ONE dest rank
+        # -> a single contiguous copy. Otherwise fall back to a head-by-head copy.
+        if (hb0 % h_local) + hb_len <= h_local:
+            dest_rank = hb0 // h_local
+            loc0 = hb0 % h_local
+            rs_in[dest_rank, :, loc0 : loc0 + hb_len, :] = out_hb
+        else:
+            for j in range(hb_len):
+                g = hb0 + j
+                rs_in[g // h_local, :, g % h_local, :] = out_hb[:, j, :]
+
+    # ONE reduce_scatter over the cp dim -> this rank's h_local-head shard summed across cp.
+    out_shard = torch.empty((rows, h_local, V), device=device, dtype=out_dtype)
+    _dist.reduce_scatter_tensor(
+        out_shard, rs_in.view(cp * rows, h_local, V), group=cp_group
+    )
+    return out_shard
+
+
 # --------------------------------------------------------------------------- indexer merge
 def _local_topk(logits, lengths, topk, *, use_b12x):
     """Per-row local top-k over a [rows, width] fp32 tile. Returns (vals[rows,topk], idx[rows,topk])."""

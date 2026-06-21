@@ -408,6 +408,28 @@ class NativeSparseAttnBackend(
         self.dcp_correct_merge = self.dcp_enabled and _os_dcp.environ.get(
             "SGLANG_NSA_DCP_CORRECT_MERGE", "0"
         ) not in ("0", "", "false", "False")
+        # DCP EXTEND (prefill) head-block streaming: bound the all-H working set in _extend_dcp so
+        # chunk>=4096 x long ctx stops OOMing. Instead of running the b12x extend kernel for ALL
+        # h_all heads at once (all-H out [rows,h_all,V] + the merge's second [cp,rows,h_local,V] copy
+        # blow VRAM), STREAM the kernel + the base-2 LSE rescale over head-BLOCKS of HB heads, writing
+        # each rescaled block straight into ONE preallocated [cp,rows,h_local,V] reduce_scatter buffer,
+        # then reduce_scatter ONCE at the end (merge_cp_correct_rs_streamed). Same online-softmax
+        # (base-2) result as merge_cp_correct_rs. Default OFF (the A/B turns it on); when OFF the
+        # _extend_dcp path is byte-identical to today. ACTIVE only for mode=="extend" (genuine prefill)
+        # AND rows >= SGLANG_NSA_DCP_EXTEND_STREAM_ROWS (default 2048) — decode/target_verify/
+        # draft_extend (small rows) keep the non-streamed merge.
+        self.dcp_extend_stream = self.dcp_enabled and _os_dcp.environ.get(
+            "SGLANG_NSA_DCP_EXTEND_STREAM", "0"
+        ) not in ("0", "", "false", "False")
+        # HB: heads per streamed block (must divide h_all=num_attention_heads). Smaller HB -> smaller
+        # transient, more kernel launches. Default 16 (h_all=64 -> 4 blocks). Env-tunable.
+        self.dcp_extend_stream_hb = int(
+            _os_dcp.environ.get("SGLANG_NSA_DCP_EXTEND_STREAM_HB", "16")
+        )
+        # Row threshold to engage streaming (skip the small-rows overhead). Default 2048.
+        self.dcp_extend_stream_rows = int(
+            _os_dcp.environ.get("SGLANG_NSA_DCP_EXTEND_STREAM_ROWS", "2048")
+        )
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -721,6 +743,7 @@ class NativeSparseAttnBackend(
                 metadata=metadata,
                 sm_scale=sm_scale,
                 v_head_dim=v_head_dim,
+                mode=mode,
             )
         # b12x 0.20.0: extend resolves the binding exactly like decode —
         # binding.selected_indices is mapped to `selected_token_offsets` inside
@@ -933,16 +956,21 @@ class NativeSparseAttnBackend(
         metadata: NSAMetadata,
         sm_scale: float,
         v_head_dim: int,
+        mode: str = "extend",
     ) -> torch.Tensor:
         """vLLM-style DCP for the EXTEND/prefill path. Mirrors _decode_dcp but uses the b12x
         extend kernel; rows = total_q query tokens. Each rank extends ALL heads over its OWNED
         selected KV shard (page-ownership, return_lse) -> LSE-merge across dcp -> head slice.
+
+        `mode` is the extend-family mode ("extend"/"target_verify"/"draft_extend"); only genuine
+        prefill ("extend") is eligible for head-block streaming (the OOM fix), and only at large rows.
         """
         import torch.nn.functional as _F
         from b12x.integration.mla import sparse_mla_extend_forward
         from sglang.srt.layers.attention.nsa.cp_nsa import (
             merge_cp_a2a,
             merge_cp_correct_rs,
+            merge_cp_correct_rs_streamed,
             merge_cp_decode_output,
             merge_cp_reduce_scatter,
             page_owned_local_selection,
@@ -973,6 +1001,67 @@ class NativeSparseAttnBackend(
         # Unconditional masked write (no-op when no empty row) — no GPU->CPU sync/layer (perf #1).
         owned_pt[empty, 0] = 0
         safe_cnt = torch.where(empty, torch.ones_like(owned_cnt), owned_cnt)
+
+        # --- HEAD-BLOCK-STREAMED extend (prefill OOM fix) ------------------------------------------
+        # Gate: streaming ON + genuine prefill (mode=="extend") + rows large enough. Decode/
+        # target_verify/draft_extend (small rows) keep the non-streamed all-H path below. When OFF the
+        # rest of this function is byte-identical to today. Stream the b12x extend kernel + the base-2
+        # LSE rescale over head-blocks of HB heads (HB | h_all) into a SINGLE [cp,rows,h_local,V]
+        # reduce_scatter buffer -> never materialize all h_all heads' partial output at once. Same
+        # online-softmax (base-2) result as merge_cp_correct_rs (see merge_cp_correct_rs_streamed).
+        if (
+            self.dcp_extend_stream
+            and mode == "extend"
+            and rows >= self.dcp_extend_stream_rows
+            and (h_all % self.dcp_extend_stream_hb) == 0
+        ):
+            hb = self.dcp_extend_stream_hb
+
+            def _run_head_block(hb0, hb_len):
+                # b12x extend over global heads [hb0:hb0+hb_len] only — HB-sized scratch (the memory
+                # bound). owned_pt/safe_cnt/cache_seqlens are head-independent and reused per block.
+                q_blk = q_gathered[:, hb0 : hb0 + hb_len, :].contiguous()
+                ws_blk = self._get_b12x_workspace(
+                    mode="extend",
+                    total_q=rows,
+                    batch=metadata.cache_seqlens_int32.shape[0],
+                    v_head_dim=v_head_dim,
+                    num_q_heads_override=hb_len,
+                )
+                binding_blk = ws_blk["plan"].bind(
+                    scratch=ws_blk["buf"],
+                    q=q_blk,
+                    selected_indices=owned_pt,
+                    cache_seqlens_int32=metadata.cache_seqlens_int32,
+                    nsa_cache_seqlens_int32=safe_cnt,
+                )
+                o_blk, lse_blk = sparse_mla_extend_forward(
+                    kv_cache=kv_cache,
+                    binding=binding_blk,
+                    sm_scale=sm_scale,
+                    v_head_dim=v_head_dim,
+                    return_lse=True,
+                    lse_scale="base2",
+                )
+                o_blk = o_blk.reshape(rows, hb_len, v_head_dim)
+                lse_blk = lse_blk.reshape(rows, hb_len).float()
+                # empty-owner rows contribute 0 in the merge — same masked write the all-H path does
+                # to lse_r before merge_cp_correct_rs (this rank's owned_cnt==0 row for ANY head).
+                lse_blk[empty] = float("-inf")
+                return o_blk, lse_blk
+
+            return merge_cp_correct_rs_streamed(
+                run_head_block=_run_head_block,
+                rows=rows,
+                h_all=h_all,
+                h_local=h_local,
+                V=v_head_dim,
+                cp_group=pg,
+                rank=rank,
+                hb=hb,
+                out_dtype=q_all.dtype,
+                device=q_all.device,
+            )
 
         ws = self._get_b12x_workspace(
             mode="extend",
