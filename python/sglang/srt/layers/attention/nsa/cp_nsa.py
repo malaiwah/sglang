@@ -446,3 +446,102 @@ def dcp_local_index_ragged_meta(real_page_table, seq_lens, seqlens_expanded,
     local_ke = (local_cu[qb] + local_seqlens_expanded.to(torch.int64)).to(torch.int32)   # [Q]
     return (local_real_pt, local_indexer_seq_lens, local_pt1,
             local_ks, local_ke, local_seqlens_expanded)
+
+
+def dcp_gather_global_index_k(local_index_k_buf, real_page_table, seq_lens,
+                              dcp_rank, dcp_size, page_size, *, cp_group=None):
+    """DCP Stage-2 RAGGED (prefill/extend), vLLM cp_gather approach: reconstruct a TRANSIENT
+    GLOBAL-page-order view of the sharded indexer index_k so the EXACT non-shard ragged indexer
+    (global block_tables + global ks/ke + plain topk_transform) can run UNCHANGED.
+
+    WHY: the b12x ragged/extend-logits kernel derives each KV token's POSITION from its column
+    order in the packed-K it is fed. The decode candidate-gather feeds COMPACTED-owned pages, which
+    scrambles those positions for the extend kernel (it buries far tokens via recency weighting) ->
+    prefill top-k is wrong (each query collapses to its own recent neighborhood). The fix is to NOT
+    compact: gather the sharded index_k back into TRUE global physical-page order, then the non-shard
+    path is correct by construction (true positions preserved). index_k stays /dcp-sharded for
+    STORAGE (the capacity win); this is a transient, sequence-scoped view computed in EAGER prefill
+    (collectives + host syncs OK; vLLM pays the same O(ctx) gather + O(ctx^2) indexer cost).
+
+    LAYOUT (mirrors NSATokenToKVPool.index_k_with_scale_buffer + index_buf_accessor):
+      each page is ONE self-contained uint8 row of width
+      W = page_size*(index_head_dim + index_head_dim//quant_block_size*4)  (= 64*128 + 64*4 = 8448);
+      bytes [0:64*128] fp8 K (token-major), bytes [64*128:] fp32 scale. Whole-row gather needs NO
+      K/scale split -> the existing GetKAndS re-slices both out of exactly this layout.
+
+    SHARD MAP (inverse of dcp_remap_index_loc / the latent pool): global physical page g lives on
+      rank owner(g)=g%dcp_size at local page slot g//dcp_size. To read a sequence's page g we need
+      its OWNER's row; we all_gather every rank's page rows for the sequence's pages, then select.
+
+    To keep the gather sequence-scoped (NOT the whole 809k pool) AND addressable by the non-shard
+    read (which indexes the buffer by block_tables entries = GLOBAL physical page ids, allocator-
+    scattered/large), we COMPACT to the sequence's distinct global pages and REWRITE block_tables to
+    the compacted dense ids. The non-shard read only ever indexes index_k via block_tables, so the
+    compaction is invisible to it; page_table_1 (latent-slot mapping) is left GLOBAL and untouched.
+
+    Args:
+      local_index_k_buf : this rank's index_k_with_scale_buffer[layer] [num_local_pages, W] uint8
+                          (from get_index_k_with_scale_buffer(layer_id)).
+      real_page_table   : [B, P] int32 GLOBAL physical page ids per sequence (page_table_64).
+      seq_lens          : [B] int — GLOBAL per-sequence KV length (indexer_seq_lens).
+      cp_group          : torch.distributed group spanning the DCP ranks.
+
+    Returns:
+      global_buf   : [num_unique_pages, W] uint8 — page row j == real index_k content of the j-th
+                     distinct global page. Feed as `buf` to a get_index_k_scale_buffer-style read.
+      block_tables_compacted : [B, P] int32 — real_page_table remapped to dense [0,num_unique)
+                     ids (in-range entries; out-of-range padding -> 0, never read since ks/ke/seqlens
+                     are global and bound the valid columns). Pass as block_tables to the read+logits.
+
+    cuda-graph: N/A (prefill is eager). One all_gather of a per-rank fixed-size page slab; host
+    syncs (.item()) are fine here.
+    """
+    import torch.distributed as _dist
+
+    dev = real_page_table.device
+    B, P = real_page_table.shape
+    W = local_index_k_buf.shape[1]
+
+    if cp_group is None or not _dist.is_initialized():
+        raise ValueError("dcp_gather_global_index_k needs cp_group + initialized distributed")
+    cp = _dist.get_world_size(cp_group)
+    assert cp == dcp_size, f"cp_group world size {cp} != dcp_size {dcp_size}"
+
+    rpt = real_page_table.to(torch.int64)                       # [B, P] global physical page ids
+    sl = seq_lens.to(torch.int64).reshape(B, 1)
+    ar = torch.arange(P, device=dev).reshape(1, P)
+    num_pages = (sl + page_size - 1) // page_size               # [B,1] logical pages used per seq
+    in_range = ar < num_pages                                   # [B,P] this entry is a real page
+
+    # 1) distinct global physical pages referenced by ANY sequence in the batch (sorted, dense).
+    #    torch.unique over the in-range entries only (mask out padding to a sentinel that we drop).
+    flat = torch.where(in_range, rpt, rpt.new_full((), -1)).reshape(-1)
+    uniq = torch.unique(flat[flat >= 0])                        # [num_unique] sorted global page ids
+    num_unique = int(uniq.numel())
+
+    # 2) owner(g)=g%cp, local_slot=g//cp. all_gather each rank's page rows for the union of pages,
+    #    then pick each page from its owner. We gather a fixed-size per-rank slab indexed by the SAME
+    #    `uniq` order on every rank: slab_r[j] = rank r's local page row for global page uniq[j]
+    #    (valid only where r owns uniq[j]; other entries are don't-care, never selected).
+    owner = (uniq % cp)                                         # [num_unique]
+    local_slot = (uniq // cp)                                   # [num_unique] local page id on owner
+    # clamp local_slot into THIS rank's buffer range for the gather index (only owned entries used).
+    max_local = local_index_k_buf.shape[0] - 1
+    my_slot = torch.clamp(local_slot, min=0, max=max_local)    # [num_unique]
+    my_slab = local_index_k_buf[my_slot].contiguous()          # [num_unique, W] (this rank's rows)
+
+    slabs = [torch.empty_like(my_slab) for _ in range(cp)]
+    _dist.all_gather(slabs, my_slab, group=cp_group)           # slabs[r] = rank r's rows for `uniq`
+    stacked = torch.stack(slabs, dim=0)                        # [cp, num_unique, W]
+    # select the OWNER rank's row for each page: global_buf[j] = stacked[owner[j], j]
+    jidx = torch.arange(num_unique, device=dev)
+    global_buf = stacked[owner, jidx].contiguous()             # [num_unique, W] global-order index_k
+
+    # 3) remap block_tables: global physical page id -> dense [0, num_unique) compacted id.
+    #    uniq is sorted, so searchsorted gives the dense id; out-of-range padding -> 0 (never read).
+    comp = torch.searchsorted(uniq, rpt.clamp(min=0))          # [B,P] dense ids (only valid in-range)
+    block_tables_compacted = torch.where(
+        in_range, comp, comp.new_zeros(())
+    ).to(torch.int32).contiguous()
+
+    return global_buf, block_tables_compacted

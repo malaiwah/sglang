@@ -2103,6 +2103,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         page_indices: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        buf_override: Optional[torch.Tensor] = None,
     ):
         """
         Fused method to get both index K and scale data in a single call using Triton.
@@ -2111,11 +2112,19 @@ class NSATokenToKVPool(MLATokenToKVPool):
         :param layer_id: Layer index
         :param seq_len: Sequence length
         :param page_indices: Page indices tensor
+        :param buf_override: DCP Stage-2 RAGGED cp_gather: read from a TRANSIENT global-page-order
+            index_k buffer (dcp_gather_global_index_k) addressed by COMPACTED block_tables, instead
+            of this rank's sharded pool buffer. Same page-row layout, so the read is byte-identical.
+            None (default) -> the normal sharded/replicated pool buffer (non-shard path unchanged).
         :return: tuple of (k_fp8, k_scale) where
                  k_fp8: (seq_len, index_head_dim), uint8
                  k_scale: (seq_len, 4), uint8
         """
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = (
+            buf_override
+            if buf_override is not None
+            else self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        )
         return index_buf_accessor.GetKAndS.execute(
             self,
             buf,
