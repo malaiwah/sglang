@@ -71,7 +71,58 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
+def _nextn_reuse_target_kv_pool_enabled() -> bool:
+    """Gate for the unified NextN/MTP KV pool (default OFF).
+
+    When ON, the NextN (MTP, layer = num_hidden_layers) draft KV does NOT get a
+    separate draft pool: it lives as one extra layer inside the TARGET's
+    token_to_kv_pool (mirroring vLLM v1). The freed standalone-draft-pool memory
+    becomes target KV, so context grows. OFF path is byte-identical to upstream.
+    """
+    import os as _os_unified
+
+    return _os_unified.environ.get(
+        "SGLANG_NEXTN_REUSE_TARGET_KV_POOL", "0"
+    ) not in ("0", "", "false", "False")
+
+
+def _num_nextn_predict_layers(model_config) -> int:
+    """Number of NextN/MTP predict layers (>=1 when the model has an MTP head)."""
+    n = getattr(model_config.hf_config, "num_nextn_predict_layers", None)
+    if n is None:
+        return 0
+    return int(n)
+
+
 class ModelRunnerKVCacheMixin:
+    def _unified_nextn_target_pool(self: ModelRunner) -> bool:
+        """True iff THIS runner participates in the unified NextN pool path AND
+        the model actually has an MTP head AND spec decoding is active.
+
+        Only the TARGET worker grows its pool; the draft worker aliases it.
+        """
+        if not _nextn_reuse_target_kv_pool_enabled():
+            return False
+        if self.spec_algorithm.is_none():
+            return False
+        # NSA-only for now (the DCP/GLM-5.2 stack). Other backends keep upstream
+        # separate-pool behavior to stay conservative.
+        if not (self.use_mla_backend and is_deepseek_nsa(self.model_config.hf_config)):
+            return False
+        return _num_nextn_predict_layers(self.model_config) > 0
+
+    def _unified_extra_nextn_layers(self: ModelRunner) -> int:
+        """Extra layers the TARGET pool must reserve for the NextN draft layer(s).
+
+        Returns 0 for the draft worker (it aliases, allocates nothing) and 0 when
+        the unified path is off, so OFF-path sizing is unchanged.
+        """
+        if self.is_draft_worker:
+            return 0
+        if not self._unified_nextn_target_pool():
+            return 0
+        return _num_nextn_predict_layers(self.model_config)
+
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
@@ -198,6 +249,11 @@ class ModelRunnerKVCacheMixin:
             num_layers = len(effective_layer_ids)
         else:
             num_layers = self.num_effective_layers
+
+        # Unified NextN pool: the TARGET pool must also hold the NextN/MTP draft
+        # layer(s), so size the budget for one extra NSA layer per nextn layer.
+        # No-op when the flag is OFF or for the draft worker (returns 0).
+        num_layers += self._unified_extra_nextn_layers()
 
         cell_size = self.get_cell_size_per_token(num_layers)
 
@@ -574,30 +630,62 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_nsa_model:
-            nsa_pool_kwargs = dict(
-                size=self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                kv_lora_rank=self.model_config.kv_lora_rank,
-                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                kv_cache_dim=self.calculate_mla_kv_cache_dim(),
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-                index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
-            )
-            if self.enable_hisparse:
-                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-                hisparse_cfg = parse_hisparse_config(self.server_args)
-                nsa_pool_kwargs["host_to_device_ratio"] = (
-                    hisparse_cfg.host_to_device_ratio
+            # Unified NextN pool: the DRAFT worker does NOT allocate its own NSA
+            # pool. It aliases the TARGET's pool (shared via the shared allocator)
+            # whose layer count already includes the NextN slot(s). The draft's
+            # NextN attention/indexer layer_id is remapped to the NextN slot in
+            # _remap_unified_nextn_layer_ids() so all get/set resolve there.
+            if (
+                self.is_draft_worker
+                and _nextn_reuse_target_kv_pool_enabled()
+                and not self.spec_algorithm.is_none()
+                and _num_nextn_predict_layers(self.model_config) > 0
+                and self.token_to_kv_pool_allocator is not None
+            ):
+                self.token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+                logger.info(
+                    "Unified NextN KV pool: draft worker aliases the target "
+                    "token_to_kv_pool (no separate draft pool allocated)."
                 )
-                self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
             else:
-                self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
+                # TARGET (or OFF path): size the pool over the effective layers
+                # plus any reserved NextN slot(s). extra==0 on the OFF path and
+                # for the draft worker, so OFF-path behavior is byte-identical.
+                _extra_nextn = self._unified_extra_nextn_layers()
+                nsa_pool_kwargs = dict(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers + _extra_nextn,
+                    device=self.device,
+                    kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=(
+                        self.end_layer + _extra_nextn
+                        if self.end_layer is not None
+                        else self.end_layer
+                    ),
+                    index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                )
+                if self.enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    hisparse_cfg = parse_hisparse_config(self.server_args)
+                    nsa_pool_kwargs["host_to_device_ratio"] = (
+                        hisparse_cfg.host_to_device_ratio
+                    )
+                    self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
+                else:
+                    self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
+                if _extra_nextn:
+                    logger.info(
+                        "Unified NextN KV pool: target pool sized over "
+                        f"{self.num_effective_layers}+{_extra_nextn} layers "
+                        "(NextN slot included)."
+                    )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -846,6 +934,71 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
+
+        # Unified NextN pool: when the draft aliases the target pool, remap the
+        # draft model's NextN attention/indexer layer_id to the NextN slot in
+        # the unified pool so all get/set_kv_buffer + index_k calls resolve there
+        # (otherwise layer_id=0 would collide with target layer 0). No-op OFF.
+        if (
+            self.is_draft_worker
+            and _nextn_reuse_target_kv_pool_enabled()
+            and not self.spec_algorithm.is_none()
+            and _num_nextn_predict_layers(self.model_config) > 0
+            and getattr(self, "model", None) is not None
+        ):
+            self._remap_unified_nextn_layer_ids()
+
+    def _remap_unified_nextn_layer_ids(self: ModelRunner) -> None:
+        """Bump the draft NextN layer's KV-indexing layer_id to the unified-pool
+        slot (= target num_effective_layers), so the NextN K/V lives in the
+        target pool's reserved trailing slot rather than colliding with layer 0.
+
+        Only RadixAttention and the NSA Indexer index the KV pool; we touch only
+        their .layer_id (and the matching start_layer offset is 0 for the target
+        pool). Weight names / MoE / scatter modes are unaffected — they key on
+        the absolute layer prefix, not this runtime KV index.
+        """
+        from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        # The unified pool was built by the TARGET with start_layer=0 and
+        # layer_num = num_effective_layers + num_nextn. The first NextN slot is
+        # therefore at index = num_effective_layers (target's), which for a
+        # non-PP NSA target equals num_hidden_layers.
+        pool = self.token_to_kv_pool
+        target_layer_num = getattr(pool, "layer_num", None)
+        num_nextn = _num_nextn_predict_layers(self.model_config)
+        if target_layer_num is None or target_layer_num <= num_nextn:
+            logger.warning(
+                "Unified NextN KV pool: unexpected pool.layer_num=%s; skipping "
+                "layer_id remap (draft would corrupt KV). Falling back is unsafe; "
+                "disable SGLANG_NEXTN_REUSE_TARGET_KV_POOL.",
+                target_layer_num,
+            )
+            return
+        nextn_slot_base = target_layer_num - num_nextn  # e.g. 78 for H=78,nextn=1
+
+        # Map each distinct draft KV layer_id (usually just {0}) to a NextN slot,
+        # preserving relative order for multi-nextn models.
+        seen = {}
+        n_remapped = 0
+        for module in self.model.modules():
+            if isinstance(module, (RadixAttention, Indexer)):
+                old = getattr(module, "layer_id", None)
+                if old is None:
+                    continue
+                if old not in seen:
+                    seen[old] = nextn_slot_base + (len(seen) % max(num_nextn, 1))
+                module.layer_id = seen[old]
+                n_remapped += 1
+        logger.info(
+            "Unified NextN KV pool: remapped %d draft KV module(s) layer_id %s "
+            "-> NextN slot(s) %s (pool layer_num=%d).",
+            n_remapped,
+            sorted(seen.keys()),
+            sorted(set(seen.values())),
+            target_layer_num,
+        )
 
     def _resolve_token_capacity(self: ModelRunner, profiled_tokens: int) -> int:
         """Compute final token pool capacity from profiled value,
