@@ -26,6 +26,74 @@ from sglang.srt.utils import (
     is_npu,
 )
 
+def _install_b12x_indexer_keyfix():
+    """Stop the b12x CUTLASS-DSL indexer from recompiling on EVERY new context length.
+
+    Root cause (proven in-container): extend_kernel._tensor_compile_key keys the OUTPUT logits
+    scratch with its dim-1 size (k_rows) + dim-0 stride, so each distinct context length misses
+    both the memory + on-disk JIT cache -> a full ~13-22s host stall (GPUs 0%) PER prefill. The
+    compiled binary is layout-dynamic and does NOT depend on k_rows, so the recompiles are
+    functionally identical. Fix: make the logits-output key shape-generic (all dims dynamic +
+    neutralize the leaked strides). Result: compile ONCE per variant, cache-hit (~0.5ms) for all
+    lengths, persisted on disk across restarts. Gated by B12X_INDEXER_KEYFIX (default on); fully
+    fail-safe (any error -> original key, never crashes the kernel).
+    """
+    import os as _os
+    if _os.environ.get("B12X_INDEXER_KEYFIX", "1") in ("0", "false", "False"):
+        return
+    _OUTPUT_KEYS = {"extend_logits", "logits"}
+    mods = []
+    try:
+        import b12x.attention.indexer.extend_kernel as _ek
+        mods.append(_ek)
+    except Exception:
+        pass
+    try:
+        import b12x.attention.indexer.kernel as _pk
+        mods.append(_pk)
+    except Exception:
+        pass
+    for mod in mods:
+        if getattr(mod, "_glm_keyfix", False) or not hasattr(mod, "_tensor_compile_key"):
+            continue
+        _orig = mod._tensor_compile_key
+
+        def _patched(name, tensor, *, dynamic_dims=(), _orig=_orig):
+            try:
+                if name in _OUTPUT_KEYS:
+                    dynamic_dims = tuple(range(tensor.ndim))
+                tk = _orig(name, tensor, dynamic_dims=dynamic_dims)
+                if name in _OUTPUT_KEYS and any(
+                    getattr(d, "kind", None) == "dynamic" for d in tk.dims
+                ):
+                    ns = tuple(
+                        -1 if getattr(d, "kind", None) == "dynamic" else s
+                        for d, s in zip(tk.dims, tk.stride)
+                    )
+                    tk = tk.__class__(
+                        name=tk.name, dtype=tk.dtype, rank=tk.rank, dims=tk.dims,
+                        stride=ns, device=tk.device, align=tk.align, layout=tk.layout,
+                    )
+                return tk
+            except Exception:
+                return _orig(name, tensor, dynamic_dims=dynamic_dims)
+
+        mod._tensor_compile_key = _patched
+        mod._glm_keyfix = True
+        try:
+            import logging as _l
+            _l.getLogger("glm_b12x_indexer").warning(
+                "B12X indexer JIT key-fix installed on %s", mod.__name__
+            )
+        except Exception:
+            pass
+
+
+try:
+    _install_b12x_indexer_keyfix()
+except Exception:
+    pass
+
 global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
