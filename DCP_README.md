@@ -66,12 +66,31 @@ To build from source instead: this branch IS a full SGLang fork — build it on 
   ragged cp_gather), and the b12x JIT key-fix monkeypatch.
 - `python/sglang/srt/mem_cache/memory_pool.py` — `NSATokenToKVPool` latent + index_k page-sharding remaps.
 
+## MTP (504B NextN spec-decode) — beats vLLM on single-stream decode
+The 504B (madeby561) has a NextN/MTP layer; `--speculative-algorithm NEXTN` (→EAGLE-v2) gives a big decode win.
+Two gotchas, both fixed on this branch:
+- NextN weight load: SGLang's `deepseek_nextn.py` nulls the modelopt_fp4 quant_config (correct for stock
+  DeepSeek-V3's BF16 MTP layer, WRONG for this REAP ckpt whose NextN experts are NVFP4-packed). Crashes with
+  `RuntimeError 6144 vs 3072 / IndexError 1536`. Fix = env `SGLANG_NEXTN_KEEP_FP4=1` (keeps fp4; the config's
+  `ignore` list keeps the genuinely-BF16 layer-78 modules BF16).
+- MTP×DCP coexistence: the EAGLE verify forward already flows through `_extend_dcp`, so latent-shard DCP works
+  with MTP out of the box; one gate (`nsa_indexer.py`, allow target_verify into the index-shard read) enables
+  full Stage-2 with MTP.
+
+Measured (504B, single-stream):
+- **MTP non-CP: ~83 tok/s** (1.85× vLLM ~45), ~12k ctx, accept 0.8.  Env: `SGLANG_NEXTN_KEEP_FP4=1` + NEXTN spec,
+  mem-frac 0.88, bs=1, no DCP.
+- **MTP + DCP Stage-2 (the speed+capacity config): 70 tok/s low-ctx → ~40 @ 17k, 47.5k ctx, needle-HIT@40k**,
+  coherent.  Env: `SGLANG_NEXTN_KEEP_FP4=1 SGLANG_NSA_DECODE_DCP=1 SGLANG_NSA_DCP_SHARD_POOL=1
+  SGLANG_NSA_DCP_SHARD_INDEX=1 SGLANG_NSA_DCP_CORRECT_MERGE=1`, mem-frac 0.88, bs=1, `--speculative-algorithm
+  NEXTN --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3`.
+The 504B+MTP is VRAM-tight (67GB/GPU weights leave little KV) — mem-frac >0.88 OOMs; that's the ~47.5k ctx ceiling.
+
 ## Honest caveats
-- Single-stream decode on PCIe (no NVLink) is the floor — the per-layer cross-rank merge is collective-bound.
-  At concurrency the aggregate beats vLLM. a2a merge was tried and is SLOWER here (all_to_all latency > ag+rs
-  for tiny decode tensors); fp4 latent KV is not in the b12x sparse-MLA kernel.
-- 504B + MTP (NextN spec-decode, `--speculative-algorithm NEXTN`) is the path to higher single-stream decode,
-  but it's non-CP (MTP+DCP conflict) and VRAM-tight — separate operating point.
+- Single-stream decode on PCIe (no NVLink) WITHOUT MTP is the floor — the per-layer cross-rank merge is
+  collective-bound (469B Stage-2 ~33 tok/s). MTP (504B) is how you beat vLLM single-stream. At concurrency the
+  aggregate beats vLLM regardless. a2a merge was tried and is SLOWER here (all_to_all latency > ag+rs for tiny
+  decode tensors); fp4 latent KV is not in the b12x sparse-MLA kernel.
 - Open improvement avenues we're chasing: b12x compile-key fixes upstreamed; PCIe one-shot allreduce for the
   merge; SGLang #27657 (CP attn-weight slice ~1.22×), #27705 (indexer fusion), #24672 (HISA), the b12x
   compressed-MLA latent for ~1M context.
