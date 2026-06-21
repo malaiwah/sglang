@@ -383,6 +383,13 @@ class NativeSparseAttnBackend(
         self.dcp_shard_index = self.dcp_shard_pool and _os_dcp.environ.get(
             "SGLANG_NSA_DCP_SHARD_INDEX", "0"
         ) not in ("0", "", "false", "False")
+        # DCP merge collective: default merge_cp_reduce_scatter (all_gather(LSE)+reduce_scatter).
+        # When ON, use merge_cp_a2a (single all-to-all of out||lse + local online-softmax) — fewer
+        # PCIe collectives per attention layer (the no-NVLink decode-throughput win, vLLM a2a path).
+        # Default OFF so the merge can be A/B'd at the same DCP layout. Same result either way.
+        self.dcp_a2a_merge = self.dcp_enabled and _os_dcp.environ.get(
+            "SGLANG_NSA_DCP_A2A_MERGE", "0"
+        ) not in ("0", "", "false", "False")
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -807,6 +814,7 @@ class NativeSparseAttnBackend(
         import torch.nn.functional as _F
         from b12x.integration.mla import sparse_mla_decode_forward
         from sglang.srt.layers.attention.nsa.cp_nsa import (
+            merge_cp_a2a,
             merge_cp_decode_output,
             merge_cp_reduce_scatter,
             page_owned_local_selection,
@@ -873,7 +881,11 @@ class NativeSparseAttnBackend(
 
         # 4) LSE-merge the per-rank all-H partials -> exact global all-H attention
         # 4+5) merge + reduce-scatter in one (vLLM cp_lse_ag_out_rs): each rank gets its TP
-        # heads directly, moving cp× less data than the all-gather merge.
+        # heads directly, moving cp× less data than the all-gather merge. When the a2a gate is on,
+        # use the single all-to-all merge (vLLM dcp_a2a_lse_reduce) — same result, fewer PCIe
+        # collectives per layer (the no-NVLink decode win).
+        if self.dcp_a2a_merge:
+            return merge_cp_a2a(o_r, lse_r, cp_group=pg, rank=rank, h_local=h_local)
         return merge_cp_reduce_scatter(o_r, lse_r, cp_group=pg, rank=rank, h_local=h_local)
 
     def _extend_dcp(
@@ -893,6 +905,7 @@ class NativeSparseAttnBackend(
         import torch.nn.functional as _F
         from b12x.integration.mla import sparse_mla_extend_forward
         from sglang.srt.layers.attention.nsa.cp_nsa import (
+            merge_cp_a2a,
             merge_cp_decode_output,
             merge_cp_reduce_scatter,
             page_owned_local_selection,
@@ -951,6 +964,9 @@ class NativeSparseAttnBackend(
         lse_r[empty] = float("-inf")  # unconditional masked write — no host sync (perf #1)
         # vLLM-style merge: all-gather LSE (tiny) + reduce_scatter the weighted output. THIS is
         # the prefill fix — 1024-row merge traffic drops 4× + no stack/merge-kernel per layer.
+        # a2a gate: single all-to-all merge (vLLM dcp_a2a_lse_reduce), same result, fewer collectives.
+        if self.dcp_a2a_merge:
+            return merge_cp_a2a(o_r, lse_r, cp_group=pg, rank=rank, h_local=h_local)
         return merge_cp_reduce_scatter(o_r, lse_r, cp_group=pg, rank=rank, h_local=h_local)
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:

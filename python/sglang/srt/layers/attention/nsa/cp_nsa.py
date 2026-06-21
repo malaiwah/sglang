@@ -118,6 +118,76 @@ def merge_cp_reduce_scatter(out_local, lse_local, *, cp_group, rank, h_local):
     return out_shard
 
 
+def merge_cp_a2a(out_local, lse_local, *, cp_group, rank, h_local):
+    """vLLM-style merge via a SINGLE all-to-all of (output, lse) instead of all_gather(LSE) +
+    reduce_scatter(output). Drop-in replacement for merge_cp_reduce_scatter: SAME inputs, SAME
+    output, SAME online-softmax (base-2) math, but cheaper PCIe collectives on the no-NVLink box.
+
+    Port of vLLM dcp_a2a_lse_reduce (vllm/v1/attention/ops/dcp_alltoall.py:282) — adapted to our
+    naming ([rows,H_all,V] / base-2 LSE) and folded into one fused a2a (out||lse packed together).
+
+    MECHANISM (why a2a == ag+rs here): each CP rank computed ALL heads over its OWN KV shard, so
+    every rank holds a partial (out, lse) for the SAME full head set but a DIFFERENT slice of the
+    KV. The exact global attention for a given head = online-softmax merge of that head's partials
+    across the cp ranks. merge_cp_reduce_scatter does this by all-gathering the tiny LSE (so every
+    rank can form the global normalizer for ALL heads) then reduce_scattering the weighted output
+    (each rank receives the sum over cp of ONLY its TP head slice). The a2a fuses the data motion:
+    instead of broadcasting every rank's head-`r` partial to rank `r` via reduce_scatter, we
+    all_to_all so the n-th send chunk (heads destined for rank n) lands at every receiver; after
+    the a2a THIS rank holds, for ITS h_local heads, the partial (out, lse) from ALL cp KV shards
+    -> a purely-local online-softmax merge gives the exact result. One a2a moves the partial
+    OUTPUT (not the weighted one), so the LSE must travel too (a2a'd in the same call), and the
+    softmax weighting + sum happen locally after exchange. Net traffic ≈ same payload as RS but
+    in ONE symmetric collective (no separate AG of LSE, no AG+RS round-trip), which on PCIe (NCCL
+    latency-bound, ctx-independent ~36 tok/s) is the win.
+
+    out_local : [rows, H_all, V] this rank's ALL-head partial over its KV shard (bf16/fp16).
+    lse_local : [rows, H_all] fp32 base-2 LSE (lse_scale="base2"); -inf rows contribute 0.
+    Returns [rows, h_local, V] (this rank's TP heads of the exact global attention), dtype ==
+    out_local.dtype. cuda-graph-safe: static shapes, NCCL a2a is capturable, no .item()/H2D copy,
+    NO Triton (pure torch combine so it captures cleanly under the decode graph).
+    """
+    import torch.distributed as _dist
+    cp = _dist.get_world_size(cp_group)
+    rows, H, V = out_local.shape
+    assert H == h_local * cp, f"merge_cp_a2a expects H_all={h_local*cp}, got {H}"
+    out_dtype = out_local.dtype
+
+    # --- pack output + lse into ONE all_to_all_single -------------------------------------------
+    # Send layout (mirrors vLLM's view(B,N,H/N,D).permute(1,0,...).contiguous()): the n-th equal
+    # split along the FLAT row holds the (heads, lse) destined for rank n. all_to_all_single's
+    # contract: input split i is SENT to rank i; output split j is RECEIVED from rank j. So after
+    # the call recv split j = rank j's partial for THIS rank's h_local heads. We carry out+lse
+    # together as fp32 (a2a needs one dtype; V*+1 fp32 elems/head — the lse cost is negligible and
+    # one collective beats two). Pack per (rank-dest, head) row of width V+1 = [out(V) | lse(1)].
+    # out_local[:, n*h_local:(n+1)*h_local, :] are the heads for rank n.
+    send_out = out_local.float().view(rows, cp, h_local, V)        # [rows, cp, h_local, V]
+    send_lse = lse_local.float().view(rows, cp, h_local, 1)        # [rows, cp, h_local, 1]
+    # [cp, rows, h_local, V+1] — leading dim = destination rank (the a2a split axis must be dim 0).
+    send_buf = torch.cat([send_out, send_lse], dim=-1).permute(1, 0, 2, 3).contiguous()
+    recv_buf = torch.empty_like(send_buf)                          # [cp, rows, h_local, V+1]
+    _dist.all_to_all_single(
+        recv_buf.view(-1), send_buf.view(-1), group=cp_group,
+    )
+    # recv_buf[j] = rank j's partial (out||lse) for THIS rank's h_local heads.
+    recv_out = recv_buf[..., :V]                                   # [cp, rows, h_local, V] fp32
+    recv_lse = recv_buf[..., V]                                    # [cp, rows, h_local]   fp32
+
+    # --- local online-softmax (base-2) combine over the cp axis --------------------------------
+    gmax = recv_lse.amax(dim=0)                                    # [rows, h_local]
+    gmax = torch.where(torch.isfinite(gmax), gmax, gmax.new_zeros(()))
+    glse = gmax + torch.log2(torch.exp2(recv_lse - gmax).sum(dim=0))  # [rows, h_local]
+    # per-shard weight; NaN GUARD identical to merge_cp_reduce_scatter: an all-(-inf) row (no rank
+    # attended any selected token) -> glse=-inf -> exp2(-inf-(-inf))=NaN; force weight 0 instead.
+    w = torch.where(
+        torch.isfinite(glse).unsqueeze(0),
+        torch.exp2(recv_lse - glse.unsqueeze(0)),
+        torch.zeros_like(recv_lse),
+    )                                                             # [cp, rows, h_local]
+    out_shard = (recv_out * w.unsqueeze(-1)).sum(dim=0)           # [rows, h_local, V] fp32
+    return out_shard.to(out_dtype).contiguous()
+
+
 # --------------------------------------------------------------------------- indexer merge
 def _local_topk(logits, lengths, topk, *, use_b12x):
     """Per-row local top-k over a [rows, width] fp32 tile. Returns (vals[rows,topk], idx[rows,topk])."""
@@ -235,16 +305,25 @@ def two_stage_global_topk_paged(logits, local_seqlens, local_real_pt, dcp_rank,
         gp * page_size + off,
         col64.new_full((), -1),
     ).to(torch.int64)                                                        # [rows, topk]
-    # 3) all-gather candidate (score, global_slot) over the DCP group
+    # 3) all-gather candidate (score, global_slot) over the DCP group — ONE collective.
+    # COMBINE (perf): instead of all_gather(vals) + all_gather(gslot) (two collectives / F-layer),
+    # pack both into a SINGLE int64 [rows, 2, topk] buffer and all_gather once. Lane 0 = global slot
+    # (already int64, exact). Lane 1 = the fp32 score bit-reinterpreted to int32 then widened to
+    # int64 (bit pattern preserved, NOT a numeric cast) so scores survive bit-exact; we bitcast back
+    # to fp32 after the gather. Halves the F-layer collective count; cuda-graph-safe (static shapes,
+    # NCCL all_gather capturable, no host sync). Numerically identical to the two-gather path.
     if gathered is None:
         if cp_group is None or not torch.distributed.is_initialized():
             raise ValueError("two_stage_global_topk_paged needs cp_group + initialized "
                              "distributed, or a precomputed `gathered` list")
         cp = torch.distributed.get_world_size(cp_group)
-        vg = [torch.empty_like(vals) for _ in range(cp)]
-        sg = [torch.empty_like(gslot) for _ in range(cp)]
-        torch.distributed.all_gather(vg, vals.contiguous(), group=cp_group)
-        torch.distributed.all_gather(sg, gslot.contiguous(), group=cp_group)
+        vbits = vals.contiguous().view(torch.int32).to(torch.int64)          # [rows, topk] score bits
+        packed = torch.stack([gslot.contiguous(), vbits], dim=1).contiguous()  # [rows, 2, topk] int64
+        pg_list = [torch.empty_like(packed) for _ in range(cp)]
+        torch.distributed.all_gather(pg_list, packed, group=cp_group)
+        # unpack each rank's slab: lane 0 -> slot (int64), lane 1 -> fp32 score (int32 view bitcast)
+        sg = [p[:, 0, :] for p in pg_list]                                    # cp × [rows, topk] int64
+        vg = [p[:, 1, :].to(torch.int32).view(torch.float32) for p in pg_list]  # cp × [rows, topk] f32
     else:
         vg = [v for v, _ in gathered]
         sg = [s for _, s in gathered]
