@@ -102,6 +102,19 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95_supported = is_gfx95_supported()
+
+# NextN/MTP draft global-topk index-share (vLLM index_share_for_mtp_iteration parity).
+# When the EAGLE/NextN draft decode runs deeper than 1 step, its hidden state drifts from
+# the verifier's, so the per-step indexer top-k drifts -> the draft attends to a DIFFERENT
+# sparse KV set than the verifier -> distributions diverge -> acceptance collapses past
+# ~2 tokens. vLLM freezes the selection: draft step 0 computes its top-k, steps 1+ REUSE
+# step-0's cached global slots (set_skip_topk). Mirror that here: cache step-0's [rows,
+# index_topk] int32 selection per Indexer layer, and on draft decode steps>=1 return the
+# cached slots instead of recomputing. DEFAULT OFF, fail-safe (any mismatch -> recompute).
+_NSA_DCP_DRAFT_GLOBAL_TOPK = (
+    __import__("os").environ.get("SGLANG_NSA_DCP_DRAFT_GLOBAL_TOPK", "0")
+    not in ("0", "false", "False", "")
+)
 if _is_cuda:
     try:
         import deep_gemm
@@ -306,6 +319,12 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        # MTP draft global-topk index-share: per-layer persistent cache of the draft's
+        # step-0 top-k selection ([rows, index_topk] int32 GLOBAL slots). Lazily allocated
+        # (shape-static once seen) and reused across draft decode steps 1+ within one MTP
+        # iteration (cuda-graph-safe: a fixed-address static buffer written in step-0's
+        # captured region and read in later steps via in-graph copy_, no .item()/H2D).
+        self._draft_topk_cache: Optional[torch.Tensor] = None
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -491,6 +510,55 @@ class Indexer(MultiPlatformOp):
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+
+        # MTP draft global-topk index-share (vLLM index_share_for_mtp_iteration parity).
+        # Resolve whether this is a NextN/EAGLE *draft decode* step and, if so, which step.
+        # During a NextN/EAGLE draft decode, eagle_worker_v2.draft_forward sets
+        #   forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+        # i.e. the per-step NativeSparseAttnBackend built by NativeSparseAttnMultiStepBackend
+        # with speculative_step_id=i. We mark those per-step backends with `.is_draft = True`
+        # (and stash `.model_runner`) in nsa_backend.py so we can robustly tell them apart from
+        # the TARGET backend (which also carries speculative_step_id=0 by default). The whole
+        # draft multi-step loop runs in ForwardMode.DECODE, so is_decode_or_idle() also keeps
+        # the target VERIFIER (target_verify mode) out of this path.
+        #
+        # On draft decode steps>=1 we REUSE the frozen step-0 global top-k selection instead of
+        # recomputing a drifting per-step selection (the cause of acceptance collapse past ~2
+        # tokens). On step 0 we compute normally then cache it. Only valid at
+        # speculative_eagle_topk==1 (chain/NextN topology); for topk>1 the draft expands a tree
+        # whose per-step rows belong to different branches, so a row-indexed cache would alias —
+        # skip the optimization there (recompute, byte-identical to the legacy path).
+        # Fully fail-safe + cuda-graph-safe (static-shape buffer, in-graph copy_/clone, no
+        # .item()/H2D; speculative_step_id is a Python int known at trace time and each draft
+        # step is its own captured region). DEFAULT OFF via SGLANG_NSA_DCP_DRAFT_GLOBAL_TOPK.
+        _draft_step = None
+        if _NSA_DCP_DRAFT_GLOBAL_TOPK and forward_batch.forward_mode.is_decode_or_idle():
+            _be = getattr(forward_batch, "attn_backend", None)
+            _be_step = getattr(_be, "speculative_step_id", None)
+            _be_is_draft = bool(getattr(_be, "is_draft", False)) or bool(
+                getattr(getattr(_be, "model_runner", None), "is_draft_worker", False)
+            )
+            # eagle_topk==1 guard: the row-indexed cache is only valid for the chain/NextN
+            # (topk==1) topology. _be.topk == speculative_eagle_topk on the per-step backend.
+            _be_topk1 = int(getattr(_be, "topk", 0) or 0) <= 1
+            if (
+                _be is not None
+                and _be_is_draft
+                and _be_step is not None
+                and _be_topk1
+            ):
+                _draft_step = int(_be_step)
+        if (
+            _draft_step is not None
+            and _draft_step >= 1
+            and self._draft_topk_cache is not None
+            and self._draft_topk_cache.shape[0] == q_fp8.shape[0]
+            and self._draft_topk_cache.shape[1] == self.index_topk
+        ):
+            # Reuse the frozen step-0 selection (already padded to q_fp8.shape[0]); skip the
+            # entire logits->topk recompute. clone() so the caller's downstream in-place ops
+            # never scribble the cache; it's a static-shape in-graph kernel -> graph-safe.
+            return self._draft_topk_cache.clone()
 
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
@@ -726,6 +794,14 @@ class Indexer(MultiPlatformOp):
                 device=topk_result.device,
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
+        # MTP draft global-topk index-share: on a draft decode step (typically step 0, or any
+        # step where the cache was stale/absent so we recomputed), freeze this selection so the
+        # remaining deeper steps in THIS MTP iteration reuse it. The whole draft multi-step loop
+        # is captured as ONE cuda graph (eagle_draft_cuda_graph_runner.run_once -> draft_forward),
+        # so the step-0 clone() and the step>=1 reader's clone() bind to consistent allocations
+        # within that single graph -> cuda-graph-safe. detach() keeps autograd out (inference).
+        if _draft_step is not None:
+            self._draft_topk_cache = topk_result.detach().clone()
         return topk_result
 
     def _should_chunk_mqa_logits(

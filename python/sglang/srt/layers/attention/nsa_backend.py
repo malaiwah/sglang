@@ -441,6 +441,14 @@ class NativeSparseAttnBackend(
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+        # MTP draft global-topk index-share signal (consumed by Indexer._get_topk_paged ONLY
+        # when SGLANG_NSA_DCP_DRAFT_GLOBAL_TOPK=1; inert otherwise). `is_draft` distinguishes a
+        # per-step NextN/EAGLE DRAFT decode backend from the TARGET backend (both carry
+        # speculative_step_id, default 0). The TARGET backend keeps is_draft=False here; the
+        # per-step draft backends built by NativeSparseAttnMultiStepBackend flip it to True.
+        # Stash model_runner too so the indexer's is_draft_worker fallback is reachable.
+        self.model_runner = model_runner
+        self.is_draft = bool(getattr(model_runner, "is_draft_worker", False))
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
@@ -2981,14 +2989,17 @@ class NativeSparseAttnMultiStepBackend:
         self.speculative_num_steps = speculative_num_steps
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends.append(
-                NativeSparseAttnBackend(
-                    model_runner,
-                    speculative_step_id=i,
-                    topk=self.topk,
-                    speculative_num_steps=self.speculative_num_steps,
-                )
+            _be = NativeSparseAttnBackend(
+                model_runner,
+                speculative_step_id=i,
+                topk=self.topk,
+                speculative_num_steps=self.speculative_num_steps,
             )
+            # Mark these as DRAFT per-step backends so Indexer._get_topk_paged can robustly
+            # detect a NextN/EAGLE draft decode step (and its step index) for the MTP
+            # global-topk index-share. Inert unless SGLANG_NSA_DCP_DRAFT_GLOBAL_TOPK=1.
+            _be.is_draft = True
+            self.attn_backends.append(_be)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
