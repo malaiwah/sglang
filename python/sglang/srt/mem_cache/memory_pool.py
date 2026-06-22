@@ -1634,6 +1634,28 @@ class MLATokenToKVPool(KVCache):
             (self._latent_buf_size + self.page_size - 1) if self._dcp_size > 1 else 0
         )
 
+        # HiSparseDCP (review C-2): DECOUPLE the index_k shard axis from the latent _dcp_size axis.
+        # Under SGLANG_NSA_HISPARSE_DCP the latent is HOST-offloaded (NOT GPU-sharded -> _dcp_size
+        # stays 1), but the index_k MUST still shard across the attention-TP ranks to lift the GPU
+        # ceiling. The index path reads _index_dcp_size/_index_dcp_rank: = attention-TP under the
+        # unified flag, ELSE alias _dcp_size/_dcp_rank so legacy DCP Stage-2 stays byte-identical.
+        _hisparse_dcp_idx = _os_dcpp.environ.get(
+            "SGLANG_NSA_HISPARSE_DCP", "0"
+        ) not in ("0", "", "false", "False")
+        self._index_dcp_size = self._dcp_size
+        self._index_dcp_rank = self._dcp_rank
+        if use_nsa and _hisparse_dcp_idx:
+            try:
+                from sglang.srt.layers.dp_attention import (
+                    get_attention_tp_rank as _itpr,
+                    get_attention_tp_size as _itps,
+                )
+
+                self._index_dcp_size = _itps()
+                self._index_dcp_rank = _itpr()
+            except Exception:
+                pass
+
         self._create_buffers()
 
         self.data_ptrs = torch.tensor(
@@ -2018,23 +2040,29 @@ class NSATokenToKVPool(MLATokenToKVPool):
         import os as _os_idx
         # DEFAULT OFF: Stage 2 is opt-in (SGLANG_NSA_DCP_SHARD_INDEX=1) until end-to-end
         # validated, so the shipped image/config keeps the proven Stage-1 behavior.
+        # HiSparseDCP: arm on the DECOUPLED _index_dcp_size axis, and under EITHER the unified flag
+        # OR the legacy SGLANG_NSA_DCP_SHARD_INDEX. (Legacy aliases _index_dcp_*=_dcp_* so identical.)
         self._shard_index = (
-            getattr(self, "_dcp_size", 1) > 1
-            and _os_idx.environ.get("SGLANG_NSA_DCP_SHARD_INDEX", "0")
-            not in ("0", "", "false", "False")
+            getattr(self, "_index_dcp_size", 1) > 1
+            and (
+                _os_idx.environ.get("SGLANG_NSA_HISPARSE_DCP", "0")
+                not in ("0", "", "false", "False")
+                or _os_idx.environ.get("SGLANG_NSA_DCP_SHARD_INDEX", "0")
+                not in ("0", "", "false", "False")
+            )
         )
         self._index_scratch_slot = 0
         if self._shard_index:
             index_buf_size = (
-                index_buf_size + self._dcp_size - 1
-            ) // self._dcp_size
+                index_buf_size + self._index_dcp_size - 1
+            ) // self._index_dcp_size
             # Reserve a guaranteed-safe scratch page for non-owned-write remap (same critical bug as
             # the latent pool). The READ path can address local slots up to
-            # _max_local_page = (ceil(global_size/ps)-1)//dcp ; size the buffer to cover that PLUS a
-            # dedicated spare page, and put the scratch slot in the spare page (never read).
+            # _max_local_page = (ceil(global_size/ps)-1)//index_dcp ; size the buffer to cover that
+            # PLUS a dedicated spare page, and put the scratch slot in the spare page (never read).
             _max_local_page = (
                 (self.size + self.page_size - 1) // self.page_size - 1
-            ) // self._dcp_size
+            ) // self._index_dcp_size
             self._index_scratch_slot = (_max_local_page + 1) * self.page_size
             index_buf_size = max(index_buf_size, (_max_local_page + 2) * self.page_size)
         # num head == 1 and head dim == 128 for index_k in NSA
@@ -2083,8 +2111,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
             return loc
         _p = loc // self.page_size
         return torch.where(
-            (_p % self._dcp_size) == self._dcp_rank,
-            (_p // self._dcp_size) * self.page_size + (loc % self.page_size),
+            (_p % self._index_dcp_size) == self._index_dcp_rank,
+            (_p // self._index_dcp_size) * self.page_size + (loc % self.page_size),
             torch.full_like(loc, self._index_scratch_slot),
         )
 

@@ -125,16 +125,24 @@ class HiSparseCoordinator:
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
-    def admit_request_into_staging(self, req: Req) -> None:
+    def admit_request_into_staging(self, req: Req, start: int = 0) -> None:
         req.hisparse_staging = True
+        full_len = len(req.fill_ids)
+        # Phase C: with incremental per-chunk offload, [0:start] is already on host -> only stage
+        # the remaining tail [start:full_len]. start=0 preserves the original full-request behavior.
         logical_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(req.fill_ids)
+            req.req_pool_idx, start:full_len
         ]
         device_indices = self.mem_pool_device._translate_loc_to_hisparse_device(
             logical_indices
         )
 
         prefill_len = len(device_indices)
+        if prefill_len == 0:
+            self.ack_staging_queue.append(
+                HiSparseAct(device_module.Event(), device_module.Event(), req)
+            )
+            return
         host_indices = self.mem_pool_host.alloc(prefill_len)
         if host_indices is None:
             logger.error(
@@ -146,7 +154,7 @@ class HiSparseCoordinator:
                 f"HiSparse host mem pool alloc failed for {prefill_len} tokens"
             )
         host_indices = host_indices.to(device=self.device)
-        self.req_to_host_pool[req.req_pool_idx, :prefill_len] = host_indices
+        self.req_to_host_pool[req.req_pool_idx, start:full_len] = host_indices
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -163,6 +171,39 @@ class HiSparseCoordinator:
                 device_indices.record_stream(self.write_staging_stream)
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
+
+    def offload_completed_prefix_chunk(
+        self, req: Req, chunk_start: int, chunk_end: int
+    ) -> int:
+        """Phase C (2a): incrementally offload a completed prefill chunk's latent device->host and
+        RECYCLE its device slots, so the hisparse device pool stays bounded during long chunked
+        prefill (fixes the ~56k overflow). Populates req_to_host_pool[req, chunk_start:aligned_end]
+        so later chunks (extend swap-in) and decode find the prefix on host. Page-aligned: a partial
+        tail is deferred to the next chunk / final admit. Returns the new offloaded length.
+        Synchronous backup (eager reference); the fused path overlaps on write_staging_stream.
+        """
+        ps = self.mem_pool_device.page_size
+        aligned_end = (chunk_end // ps) * ps
+        if aligned_end <= chunk_start:
+            return chunk_start
+        logical = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, chunk_start:aligned_end
+        ]
+        device_indices = self.mem_pool_device._translate_loc_to_hisparse_device(logical)
+        n = aligned_end - chunk_start
+        host_indices = self.mem_pool_host.alloc(n)
+        if host_indices is None:
+            raise RuntimeError(
+                f"HiSparse Phase C: host alloc failed for {n} tokens (req {req.rid})"
+            )
+        host_indices = host_indices.to(device=self.device)
+        self.req_to_host_pool[req.req_pool_idx, chunk_start:aligned_end] = host_indices
+        self.mem_pool_host.backup_from_device_all_layer(
+            self.mem_pool_device, host_indices, device_indices, io_backend="kernel"
+        )
+        device_module.synchronize()
+        self.token_to_kv_pool_allocator.free_hisparse(logical)
+        return aligned_end
 
     def admit_request_direct(self, req: Req) -> None:
         """Direct-to-host path: KV data already resides in host pool via RDMA.
@@ -560,6 +601,89 @@ class HiSparseCoordinator:
             top_k_indices[i, :top_n] = device_indices.to(torch.int32)
 
         return top_k_indices
+
+    def _get_extend_scratch(self, need: int) -> torch.Tensor:
+        """Phase C (2b): a cached device scratch arena (hisparse slots) reused across layers/chunks
+        for staging the extend top-k union. Grows on demand. Reused safely because layers run
+        sequentially (layer N attention reads the arena before layer N+1 overwrites it)."""
+        ps = self.mem_pool_device.page_size
+        cur = getattr(self, "_extend_scratch", None)
+        if cur is not None and cur.numel() >= need:
+            return cur
+        cap = ((max(need, getattr(self, "_extend_scratch_cap", 16384)) + ps - 1) // ps) * ps
+        if cur is not None:
+            self.token_to_kv_pool_allocator.free_hisparse_indices(cur)
+        scratch = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(cap)
+        if scratch is None:
+            raise RuntimeError(
+                f"HiSparse Phase C: extend scratch alloc failed for {cap} slots "
+                f"(hisparse pool exhausted — tile the chunk or raise device_buffer)"
+            )
+        self._extend_scratch = scratch.to(self.device)
+        self._extend_scratch_cap = cap
+        return self._extend_scratch
+
+    def swap_in_selected_pages_extend(
+        self, top_k_tokens: torch.Tensor, req_pool_indices: torch.Tensor, layer_id: int
+    ) -> torch.Tensor:
+        """Phase C (2b) EAGER reference: stage the per-QUERY-TOKEN top-k prefix for b12x EXTEND.
+
+        top_k_tokens [num_q, top_k] int32 = request-LOCAL token_pos (-1 padding; produced by the
+        C-1 conversion in nsa_backend). Returns [num_q, top_k] int32 device-buffer slots that
+        sparse_mla_extend_forward consumes (flat slot -> idx//64/idx%64).
+
+        Residency classification (the review's key fix): a token is HOST-resident iff
+        req_to_host_pool[req, tp] >= 0 (offloaded by 2a) -> de-dup the chunk's union + batch-stage
+        host->device into the scratch arena; else it is IN-CHUNK device-resident -> translate the
+        logical slot. Vectorized (no per-token Python loop) so it runs as a correctness reference.
+        Single-request (bs=1) path; multi-request needs token_to_req (Phase 2).
+        """
+        req_idx = int(req_pool_indices[0].item())
+        tp = top_k_tokens.to(torch.int64)
+        valid = tp >= 0
+        tp_c = tp.clamp(min=0)
+        host_locs = self.req_to_host_pool[req_idx, tp_c]
+        host_mask = valid & (host_locs >= 0)
+        dev_mask = valid & (host_locs < 0)
+        out = torch.full(tp.shape, -1, dtype=torch.int64, device=self.device)
+        if bool(dev_mask.any()):
+            logical = self.req_to_token_pool.req_to_token[req_idx, tp_c]
+            dev = self.mem_pool_device._translate_loc_to_hisparse_device(logical)
+            out = torch.where(dev_mask, dev.to(torch.int64), out)
+        if bool(host_mask.any()):
+            unique_tp, inv = torch.unique(tp[host_mask], return_inverse=True)
+            U = int(unique_tp.numel())
+            if U > getattr(self, "_max_union_seen", 0):
+                self._max_union_seen = U
+                logger.warning(
+                    "PhaseC extend union U=%d layer=%d num_q=%d host=%d maxtp=%d",
+                    U,
+                    layer_id,
+                    int(tp.shape[0]),
+                    int(host_mask.sum()),
+                    int(tp.max()),
+                )
+            arena = self._get_extend_scratch(U)
+            host_u = self.req_to_host_pool[req_idx, unique_tp]
+            slots_u = arena[:U]
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device, host_u, slots_u, layer_id, io_backend="kernel"
+            )
+            out[host_mask] = slots_u[inv]
+        # Phase C debug: catch OOB device slots in Python (clear msg) before the b12x kernel reads.
+        _cap = (
+            getattr(self.token_to_kv_pool_allocator, "_size_hisparse", 1 << 30)
+            + self.mem_pool_device.page_size
+        )
+        _bad = (out >= _cap) | (out < -1)
+        if bool(_bad.any()):
+            _hu = int(unique_tp.numel()) if bool(host_mask.any()) else 0
+            raise AssertionError(
+                f"PhaseC extend OOB slots {out[_bad][:8].tolist()} >= cap {_cap} "
+                f"(layer {layer_id} num_q {tp.shape[0]} host_U {_hu} "
+                f"dev {int(dev_mask.sum())} host {int(host_mask.sum())})"
+            )
+        return out.to(torch.int32)
 
     def abort_staging_request(self, req: Req) -> None:
         """Remove a request from the staging queue and free its host resources.

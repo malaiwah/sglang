@@ -877,6 +877,8 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        # Phase C: cumulative prefill tokens already offloaded device->host (incremental offload).
+        self.hisparse_offloaded_len = 0
 
     @property
     def seqlen(self) -> int:

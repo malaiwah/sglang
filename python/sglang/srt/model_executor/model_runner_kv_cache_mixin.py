@@ -171,16 +171,32 @@ class ModelRunnerKVCacheMixin:
                 not in ("0", "", "false", "False")
                 and _datps() > 1
             )
+            # HiSparseDCP: define the unified-flag + Phase-B offload booleans up front (used by BOTH
+            # the latent term here and the index_k shard term below). _datps() is the attention-TP
+            # size = the pool's _index_dcp_size (the index shard divisor).
+            _hisparse_dcp = _os_dcpm.environ.get(
+                "SGLANG_NSA_HISPARSE_DCP", "0"
+            ) not in ("0", "", "false", "False")
+            _hisparse_offload = _hisparse_dcp and _os_dcpm.environ.get(
+                "SGLANG_NSA_HISPARSE_DCP_OFFLOAD", "0"
+            ) not in ("0", "", "false", "False")
             if _cp_shard:
                 cell_size = cell_size // _dacps()  # arm-C latent /cp
             elif _dcp_on:
                 cell_size = cell_size // _datps()  # latent /dcp
+            if _hisparse_offload:
+                # Phase B: latent is HOST-offloaded -> 0 per-token GPU bytes. The small fixed device
+                # hot buffer is a one-time reservation in profile_max_num_token, NOT per-token.
+                cell_size = 0
             # DCP Stage 2: the indexer index_k pool is also sharded /dcp by page when
             # SGLANG_NSA_DCP_SHARD_INDEX is on -> divide the indexer cell too. MUST match
             # NSATokenToKVPool.__init__'s index_buf_size //= dcp, else the pool sizer and the
             # actual buffer disagree. This is what grows max_total toward ~4x/809k.
-            _shard_index = _dcp_on and (
-                _os_dcpm.environ.get("SGLANG_NSA_DCP_SHARD_INDEX", "0")
+            # HiSparseDCP: index_k shards on the attention-TP axis under the unified flag too
+            # (decoupled from latent _dcp). Divisor _datps() MUST equal pool._index_dcp_size.
+            _shard_index = (_dcp_on or (_hisparse_dcp and _datps() > 1)) and (
+                _hisparse_dcp
+                or _os_dcpm.environ.get("SGLANG_NSA_DCP_SHARD_INDEX", "0")
                 not in ("0", "", "false", "False")
             )
 

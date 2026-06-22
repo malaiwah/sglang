@@ -608,7 +608,11 @@ class Indexer(MultiPlatformOp):
             )
 
             block_tables, seqlens_32, local_pt1_override = dcp_local_index_paged_tables(
-                block_tables, seqlens_32, _pool._dcp_rank, _pool._dcp_size, page_size
+                block_tables,
+                seqlens_32,
+                getattr(_pool, "_index_dcp_rank", _pool._dcp_rank),
+                getattr(_pool, "_index_dcp_size", _pool._dcp_size),
+                page_size,
             )
             # block_tables is now this rank's COMPACTED local page table (local_real_pt); keep a
             # handle for the global-slot remap of the selected columns after the logits.
@@ -773,8 +777,8 @@ class Indexer(MultiPlatformOp):
                 logits,
                 seqlens_32,
                 _local_real_pt,
-                _pool._dcp_rank,
-                _pool._dcp_size,
+                getattr(_pool, "_index_dcp_rank", _pool._dcp_rank),
+                getattr(_pool, "_index_dcp_size", _pool._dcp_size),
                 page_size,
                 self.index_topk,
                 cp_group=_dcp_pg,
@@ -982,8 +986,8 @@ class Indexer(MultiPlatformOp):
                 local_index_buf,
                 block_tables,
                 indexer_seq_len_dev,
-                _pool_r._dcp_rank,
-                _pool_r._dcp_size,
+                getattr(_pool_r, "_index_dcp_rank", _pool_r._dcp_rank),
+                getattr(_pool_r, "_index_dcp_size", _pool_r._dcp_size),
                 page_size,
                 cp_group=_dcp_pg_r,
             )
@@ -1396,7 +1400,13 @@ class Indexer(MultiPlatformOp):
         # IMPORTANT: do NOT mutate forward_batch.out_cache_loc (the latent set_mla_kv_buffer reads it
         # and applies its own remap); build a private remapped copy instead.
         pool = forward_batch.token_to_kv_pool
-        idx_loc = pool.dcp_remap_index_loc(forward_batch.out_cache_loc)
+        # HiSparse pools (HiSparseNSATokenToKVPool) lack the DCP index remap; they stage host<->device
+        # themselves, so use the raw out_cache_loc. dcp_remap_index_loc is a no-op when DCP index
+        # sharding is off, so guarding by attribute presence is safe for both pool types.
+        if hasattr(pool, "dcp_remap_index_loc"):
+            idx_loc = pool.dcp_remap_index_loc(forward_batch.out_cache_loc)
+        else:
+            idx_loc = forward_batch.out_cache_loc
 
         # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
         if (

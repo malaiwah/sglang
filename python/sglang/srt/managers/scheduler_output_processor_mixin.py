@@ -193,7 +193,15 @@ class SchedulerOutputProcessorMixin:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
-                            self.hisparse_coordinator.admit_request_into_staging(req)
+                            _hsd = __import__("os").environ.get(
+                                "SGLANG_NSA_HISPARSE_DCP", "0"
+                            ) not in ("0", "", "false", "False")
+                            # Phase C: [0:offloaded_len] already on host (incremental offload);
+                            # only stage the tail. start=0 = original full-request behavior.
+                            self.hisparse_coordinator.admit_request_into_staging(
+                                req,
+                                start=(req.hisparse_offloaded_len if _hsd else 0),
+                            )
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -250,6 +258,17 @@ class SchedulerOutputProcessorMixin:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
+                    # Phase C (2a): incrementally offload this just-committed chunk's latent
+                    # device->host + recycle device slots, so the hisparse device pool stays
+                    # bounded across a long chunked prefill (fixes the ~56k overflow).
+                    if self.enable_hisparse and __import__("os").environ.get(
+                        "SGLANG_NSA_HISPARSE_DCP", "0"
+                    ) not in ("0", "", "false", "False"):
+                        req.hisparse_offloaded_len = (
+                            self.hisparse_coordinator.offload_completed_prefix_chunk(
+                                req, req.hisparse_offloaded_len, req.kv_committed_len
+                            )
+                        )
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.

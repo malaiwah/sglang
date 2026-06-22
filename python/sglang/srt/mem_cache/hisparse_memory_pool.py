@@ -57,6 +57,9 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
             kv_cache_dim=kv_cache_dim,
             start_layer=start_layer,
             end_layer=end_layer,
+            # index_k must cover the FULL addressable context (size*ratio). Under HiSparseDCP the
+            # base NSATokenToKVPool then shards it /index_dcp (-> size*ratio/index_dcp per rank,
+            # covering addressable/index_dcp). So KEEP the *ratio here; the /index_dcp does the win.
             index_buf_size=size * host_to_device_ratio,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize

@@ -533,7 +533,14 @@ class NativeSparseAttnBackend(
             )
         if model_runner.server_args.enable_nsa_prefill_context_parallel:
             raise ValueError("b12x does not support NSA context parallel in v1.")
-        if getattr(model_runner, "enable_hisparse", False):
+        if getattr(model_runner, "enable_hisparse", False) and __import__(
+            "os"
+        ).environ.get("SGLANG_NSA_B12X_HISPARSE", "0") in ("0", "", "false", "False"):
+            # SGLANG_NSA_B12X_HISPARSE=1 enables the HiSparse-on-b12x port: host-pinned full
+            # fp8 KV pool + the b12x NSA-indexer top-k drives host->GPU hot-page staging, and
+            # b12x sparse-MLA reads the staged hot-buffer (same tensor). Decouples context from
+            # GPU KV budget. The force_unfused topk path (get_indexer_metadata) already emits
+            # request-local positions for the staging hook regardless of backend. OFF -> reject.
             raise ValueError("b12x does not support HiSparse in v1.")
 
     def _get_b12x_workspace(
@@ -2246,14 +2253,45 @@ class NativeSparseAttnBackend(
 
         # todo hisparse: to cover more backends
         if forward_batch.hisparse_coordinator is not None:
-            page_table_1 = (
-                forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device(
-                    page_table_1
+            _os_e = __import__("os").environ
+            if _os_e.get("SGLANG_NSA_HISPARSE_DCP", "0") not in (
+                "0",
+                "",
+                "false",
+                "False",
+            ) and _os_e.get("SGLANG_NSA_HISPARSE_EXTEND_BYPASS", "0") in (
+                "0",
+                "",
+                "false",
+                "False",
+            ):
+                # Phase C (2b): the prefix latent was incrementally OFFLOADED to host during chunked
+                # prefill (2a), so a bare translate would hit freed/zeroed device slots. Classify each
+                # [num_q, top_k] global LOGICAL slot by residency and stage host-resident ones.
+                # C-1: token_pos = global_slot - req_base (req KV contiguous from req_to_token[req,0]).
+                _r2t = forward_batch.req_to_token_pool.req_to_token
+                _base = _r2t[forward_batch.req_pool_indices[:1], 0].to(torch.int64)
+                _tp = torch.where(
+                    page_table_1 >= 0,
+                    page_table_1.to(torch.int64) - _base,
+                    page_table_1.to(torch.int64),
+                ).to(torch.int32)
+                page_table_1 = (
+                    forward_batch.hisparse_coordinator.swap_in_selected_pages_extend(
+                        _tp, forward_batch.req_pool_indices, layer.layer_id
+                    )
                 )
-            )
+            else:
+                page_table_1 = (
+                    forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device(
+                        page_table_1
+                    )
+                )
 
         if nsa_impl == "b12x":
-            if forward_batch.hisparse_coordinator is not None:
+            if forward_batch.hisparse_coordinator is not None and __import__(
+                "os"
+            ).environ.get("SGLANG_NSA_B12X_HISPARSE", "0") in ("0", "", "false", "False"):
                 raise ValueError("b12x does not support HiSparse in v1.")
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2418,7 +2456,51 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
+        # HiSparseDCP (review C-1 fix, probe-verified): the index-shard merge
+        # (two_stage_global_topk_paged) emits GLOBAL KV slots, but the HiSparse staging kernel
+        # indexes top_k_result as request-LOCAL token_pos (req_to_host_pool[req, token_pos]). The
+        # request's KV is contiguous from req_base = req_to_token[req, 0] (probe: r2t=[64,65,66,..],
+        # merge emitted 64..70 for seq_len 7), so token_pos = global_slot - req_base. Pure device
+        # tensor ops (cuda-graph-safe; no host sync). Gated on the unified flag; -1 padding preserved.
+        if (
+            forward_batch.hisparse_coordinator is not None
+            and topk_indices is not None
+            and __import__("os").environ.get("SGLANG_NSA_HISPARSE_DCP", "0")
+            not in ("0", "", "false", "False")
+        ):
+            _r2t = forward_batch.req_to_token_pool.req_to_token
+            _base = _r2t[forward_batch.req_pool_indices, 0].to(torch.int64)  # [num_reqs]
+            if _base.shape[0] == topk_indices.shape[0]:
+                _base = _base.unsqueeze(1)
+            else:
+                _base = _base[:1].expand(topk_indices.shape[0]).unsqueeze(1)
+            topk_indices = torch.where(
+                topk_indices >= 0,
+                topk_indices.to(torch.int64) - _base,
+                topk_indices.to(torch.int64),
+            ).to(torch.int32)
+
         if forward_batch.hisparse_coordinator is not None:
+            import os as _os_hsd
+            if (
+                _os_hsd.environ.get("SGLANG_NSA_HISPARSE_DCP_DEBUG")
+                and getattr(type(self), "_dbg_hsd", 0) < 3
+                and not torch.cuda.is_current_stream_capturing()
+                and topk_indices is not None
+            ):
+                type(self)._dbg_hsd = getattr(type(self), "_dbg_hsd", 0) + 1
+                _ti = topk_indices[0]
+                _v = _ti[_ti >= 0]
+                _bt = forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices[0]
+                ]
+                print(
+                    f"[HSD-PROBE L{layer.layer_id}] seq_len={int(forward_batch.seq_lens[0])} "
+                    f"topk_n={_v.numel()} topk_min={int(_v.min()) if _v.numel() else -1} "
+                    f"topk_max={int(_v.max()) if _v.numel() else -1} topk[:8]={_ti[:8].tolist()} "
+                    f"req_base={int(_bt[0])} r2t[:4]={_bt[:4].tolist()}",
+                    flush=True,
+                )
             page_table_1 = forward_batch.hisparse_coordinator.swap_in_selected_pages(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -2466,7 +2548,9 @@ class NativeSparseAttnBackend(
             )
 
         if self.nsa_decode_impl == "b12x":
-            if forward_batch.hisparse_coordinator is not None:
+            if forward_batch.hisparse_coordinator is not None and __import__(
+                "os"
+            ).environ.get("SGLANG_NSA_B12X_HISPARSE", "0") in ("0", "", "false", "False"):
                 raise ValueError("b12x does not support HiSparse in v1.")
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)

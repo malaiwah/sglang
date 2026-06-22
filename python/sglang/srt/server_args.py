@@ -6626,7 +6626,17 @@ class ServerArgs:
                 ("nsa_decode_backend", "decode"),
             ]:
                 backend = getattr(self, attr)
-                if backend is not None and backend != "flashmla_sparse":
+                # SGLANG_NSA_B12X_HISPARSE=1 enables the HiSparse-on-b12x port: allow the b12x
+                # sparse-MLA backend with HiSparse (host-pinned KV + indexer-top-k hot staging);
+                # the b12x decode reads the staged hot-buffer (same tensor). Otherwise unchanged.
+                _b12x_hisparse = __import__("os").environ.get(
+                    "SGLANG_NSA_B12X_HISPARSE", "0"
+                ) not in ("0", "", "false", "False")
+                if (
+                    backend is not None
+                    and backend != "flashmla_sparse"
+                    and not (backend == "b12x" and _b12x_hisparse)
+                ):
                     raise ValueError(
                         f"HiSparse requires flashmla_sparse NSA {label} backend, "
                         f"but got --nsa-{label}-backend={backend}. "
